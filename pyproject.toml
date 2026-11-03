@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpuq"
+version = "0.1.0"
+description = "A cooperative GPU queue for shared workstations: humans and AI agents take turns, jobs yield by heartbeat instead of being killed."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "unconventio"}]
+keywords = ["gpu", "queue", "scheduler", "nvidia", "amd", "ai-agents"]
+dependencies = []
+classifiers = ["Environment :: Console", "Operating System :: POSIX :: Linux", "License :: OSI Approved :: MIT License"]
+
+[project.urls]
+Homepage = "https://codeberg.org/unconventio/gpuq"
+Repository = "https://codeberg.org/unconventio/gpuq"
+
+[project.scripts]
+gpuq = "gpuq.cli:main"
+
+[tool.setuptools]
+packages = ["gpuq"]
