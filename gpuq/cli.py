@@ -460,6 +460,16 @@ def store(write=True):
         old = raw if isinstance(raw, list) else None
         found = {} if old is not None else raw.get("lines", {})
         default = default_card(cards, found)
+        # A host that had no detectable card kept its line under the placeholder name "gpu".
+        # Once a card is detected, that line moves to the card's (empty) line, running job and all.
+        if cards and "gpu" in found and "gpu" not in cards:
+            legacy = found.pop("gpu")
+            if legacy and not found.get(default):
+                for e in legacy:
+                    e["gpu"] = default
+                found[default] = legacy
+            elif legacy:
+                found["gpu"] = legacy      # the card's line is in use: leave both alone
         lines = {default: old if old is not None else found.get(default, [])}
         for name in list(cards) + list(found):
             lines.setdefault(name, found.get(name, []))

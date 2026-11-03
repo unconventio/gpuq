@@ -177,6 +177,26 @@ class Usage(Fixture):
         self.assertTrue(view)
 
 
+class Migrate(Fixture):
+    def test_placeholder_line_moves_to_the_detected_card(self):
+        self.laptop()
+        state = self.tmp / "state"
+        write(state / "queue.json", json.dumps({"lines": {"gpu": [
+            {"id": "ab12", "owner": "x", "job": "j", "why": "", "models": [], "est_min": 60, "max_min": None,
+             "progress": "", "state": "running", "joined": 1.0, "started": 2.0, "heartbeat": 3.0,
+             "head_since": None, "skips": 0, "important": False}]}}))
+        old = g.STATE
+        g.STATE = state
+        try:
+            with g.store() as Q:
+                self.assertEqual(list(Q["lines"]), ["880M"])
+                self.assertEqual(Q["lines"]["880M"][0]["state"], "running")
+            data = json.loads((state / "queue.json").read_text())
+            self.assertEqual(list(data["lines"]), ["880M"])
+        finally:
+            g.STATE = old
+
+
 class EndToEnd(Fixture):
     def cli(self, *args, **kw):
         env = dict(os.environ, GPUQ_STATE=str(self.tmp / "state"), GPUQ_SYSFS=str(self.sys),
