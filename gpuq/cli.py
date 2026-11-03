@@ -845,8 +845,11 @@ def local_snapshot(now):
             loaded = gpu_loaded()
         else:
             loaded = [j for u in use.values() for j in u["jobs"]]
-        return snapshot(lines[Q["default"]], now, history(), loaded, paused=paused_state(),
+        snap = snapshot(lines[Q["default"]], now, history(), loaded, paused=paused_state(),
                         lines=lines, cards=cards, card_use=use, default=Q["default"], evac=read_evac())
+        if use and len(use) == 1:       # one card: per_card() leaves the snapshot alone, so carry busy here
+            snap["busy"] = next(iter(use.values())).get("busy")
+        return snap
 
 
 def remote_snapshot(host):
