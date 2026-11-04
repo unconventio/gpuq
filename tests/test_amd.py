@@ -151,6 +151,15 @@ class Usage(Fixture):
         self.assertTrue(use["jobs"][0].startswith("ollama 6."), use["jobs"])
         self.assertEqual(use["busy"], 97)
 
+    def test_forked_workers_share_one_client(self):
+        """PyTorch data-loader workers inherit the trainer's DRM file: count it once, by the parent."""
+        self.laptop()
+        add_proc(self.proc, 200, "trainer", 42, "0000:65:00.0", 3448, 5 * 1048576)
+        for pid in range(201, 219):
+            add_proc(self.proc, pid, "pt_data_worker", 42, "0000:65:00.0", 3448, 5 * 1048576)
+        jobs = g.amd_usage(g.amd_cards())["880M"]["jobs"]
+        self.assertEqual(jobs, ["trainer 5.0G"], jobs)
+
     def test_card_usage_and_residents(self):
         self.laptop()
         add_proc(self.proc, 100, "whisper-server", 7, "0000:65:00.0", 0, 2 * 1048576)

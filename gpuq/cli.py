@@ -1078,7 +1078,9 @@ def amd_usage(cards):
     by_pci = {c["pci"]: n for n, c in amd.items() if c.get("pci")}
     seen, per = set(), {n: {} for n in amd}
     try:
-        pids = [p for p in PROC.iterdir() if p.name.isdigit()]
+        # lowest pid first: forked children (PyTorch data-loader workers) inherit their parent's
+        # DRM file, and the parent is the one to name
+        pids = sorted((p for p in PROC.iterdir() if p.name.isdigit()), key=lambda p: int(p.name))
     except OSError:
         pids = []
     for p in pids:
@@ -1097,7 +1099,9 @@ def amd_usage(cards):
             for line in info.splitlines():
                 k, _, v = line.partition(":")
                 kv[k.strip()] = v.strip()
-            card, cid = by_pci.get(kv.get("drm-pdev", "")), (p.name, kv.get("drm-client-id"))
+            # one DRM client = one open file; it shows up in every process that shares it (dup,
+            # fork), so count each client once per device, not once per process
+            card, cid = by_pci.get(kv.get("drm-pdev", "")), (kv.get("drm-pdev"), kv.get("drm-client-id"))
             if card is None or cid in seen:
                 continue
             seen.add(cid)
