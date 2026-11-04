@@ -357,9 +357,9 @@ class Display(unittest.TestCase):
         from gpuq import cli as g
         snap = {"host": "a", "entries": [], "card": None, "meters": {"3090": {"used_mib": 12288, "util": 50}},
                 "cards": {"3090": {"mib": 24576, "model": "RTX 3090"}}}
-        (text, st), = g.summary_lines([("a", snap, None)], ["a"])
+        (_, _), (text, st) = g.summary_lines([("a", snap, None)], ["a"])
         self.assertIn("RTX 3090", text)
-        self.assertIn("@ a", text)
+        self.assertNotIn(" a ", text)
         self.assertIn("█████░░░░░", text)
         self.assertIn("idle", text)
         self.assertEqual(st, "m0")

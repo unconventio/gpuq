@@ -386,34 +386,38 @@ def summary_lines(views, hosts, width=120):
                           if gib else "", host=host, used=m.get("used_mib"), gib=gib, util=m.get("util"),
                           what=what, st="m%d" % idx))
 
+    many = len({f["host"] for f in facts}) > 1      # one machine: no machine column
+    heads = ["GPU", "SIZE", "HOST", "MEMORY", "LOAD"]
+
     def cols(f, bars, host_max, size=True):
         used, gib, util = f["used"], f["gib"], f["util"]
         frac = used / gib if used is not None and gib else None
         h = f["host"] if len(f["host"]) <= host_max else f["host"][:host_max - 1] + "…"
         if bars:
-            mem = "mem %s %s" % (_bar(frac, bars), "%4.1f GB" % (used / 1024) if used is not None else "   ?   ")
-            gpu = "gpu %s %s" % (_bar(util / 100 if util is not None else None, bars),
-                                 "%3d%%" % util if util is not None else "  ?")
+            mem = "%s %s" % (_bar(frac, bars), "%4.1f GB" % (used / 1024) if used is not None else "   ?   ")
+            gpu = "%s %s" % (_bar(util / 100 if util is not None else None, bars),
+                             "%3d%%" % util if util is not None else "  ?")
         else:
-            mem = "mem %s" % ("%3d%%" % round(frac * 100) if frac is not None else "  ?")
-            gpu = "gpu %s" % ("%3d%%" % util if util is not None else "  ?")
-        return [f["name"], f["size"] if size else "", "@ " + h, mem, gpu]
+            mem = "%3d%%" % round(frac * 100) if frac is not None else "  ?"
+            gpu = "%3d%%" % util if util is not None else "  ?"
+        return [f["name"], f["size"] if size else "", h if many else "", mem, gpu]
 
     def layout(bars, host_max, size=True):
         rows = [cols(f, bars, host_max, size) for f in facts]
-        widths = [max(len(r[i]) for r in rows) for i in range(5)] if rows else []
-        return ["  " + "  ".join(x.ljust(widths[i]) for i, x in enumerate(r) if widths[i]) + "   "
-                for r in rows]
+        keep = [i for i in range(5) if any(r[i] for r in rows)]
+        widths = {i: max([len(r[i]) for r in rows] + [len(heads[i])]) for i in keep}
+        fmt = lambda r: "  " + "  ".join(r[i].ljust(widths[i]) for i in keep) + "   "
+        return fmt(heads), [fmt(r) for r in rows]
 
     longest = max((len(f["host"]) for f in facts), default=0)
     # (bar cells, longest machine name, show size): roomiest first, keep ~30 cells for what runs
     steps = [(10, longest, True), (5, longest, True), (0, longest, True), (0, 12, True),
              (0, 12, False), (0, 8, False)]
     for bars, host_max, size in steps:
-        lead = layout(bars, host_max, size)
+        head, lead = layout(bars, host_max, size)
         if max((len(x) for x in lead), default=0) + 30 <= width:
             break
-    out = []
+    out = [((head + "RUNNING").rstrip(), "dim")] if facts else []
     for x, f in zip(lead, facts):
         room = max(width - 1 - len(x), 0)
         out.append(((x + _trim(f["what"], room)).rstrip() if room else x.rstrip(), f["st"]))
