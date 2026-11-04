@@ -28,6 +28,15 @@ Several cards: every card has its own line, named by its model number (e.g. 3090
             unless you add --gpu. `gpuq run` hands the job its card in CUDA_VISIBLE_DEVICES
             (by UUID — the index order differs between nvidia-smi and CUDA); `start` prints it.
 
+Fleet:      gpuq inventory [--hosts a,b]    what each card offers: usable memory, tags, residents, wait
+            gpuq where --vram 16 [--tag rocm] [--est 30]   which card on which host fits, soonest first
+            gpuq join ... --vram 16 [--tag T]              picks the best local card that fits
+            gpuq free [CARD]  ·  gpuq restore             unload/stop a card's residents; bring them back
+            gpuq init                                      write a starter config from what is detected
+            gpuq mcp                                       the same, as an MCP server for agents (stdio)
+JSON:       --json on join/start/beat/done/... prints one object (state go/wait/gone, ok/yield/purged);
+            `gpuq join --spec -` reads the job as a JSON object.
+
 Config (optional JSON, ~/.config/gpuq/config.json or $GPUQ_CONFIG): see examples/config.json.
 """
 import argparse
@@ -46,6 +55,7 @@ from pathlib import Path
 
 from .core import *  # noqa: F401,F403  (pure queue operations, re-exported for callers)
 from .core import QueueError, fmt_dur, yielding, running, normalize, find, remove
+from . import fleet
 
 HOST = socket.gethostname()
 STATE = Path(os.environ.get("GPUQ_STATE") or Path.home() / ".local" / "state" / "gpuq")
@@ -56,9 +66,9 @@ CONFIG = Path(os.environ.get("GPUQ_CONFIG") or Path.home() / ".config" / "gpuq" 
 # (only if gpuq wrote it). Set `compat_lock` in the config, or $GPUQ_COMPAT_LOCK. "" disables.
 COMPAT_LOCK = os.environ.get("GPUQ_COMPAT_LOCK")     # None = ask the config
 # Per-host settings (all optional), see examples/config.json:
-#   default, owners, residents, units, hosts, compat_lock, remote_command
+#   default, owners, cards, residents, units, hosts, compat_lock, remote_command
 # Residents are always-on services that live on a card outside the queue: never "unqueued use",
-# flagged if on the wrong card.
+# flagged if on the wrong card. `cards` caps, reserves and tags a card's memory (see fleet.py).
 
 
 # ---- formatting ----
@@ -512,6 +522,23 @@ def read_evac():
         return None
 
 
+def read_freed():
+    """{unit: card} for resident units `gpuq free` stopped (restore starts them again)."""
+    try:
+        return json.loads((STATE / "freed.json").read_text()).get("units") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def write_freed(units):
+    STATE.mkdir(parents=True, exist_ok=True)
+    path = STATE / "freed.json"
+    if units:
+        path.write_text(json.dumps({"units": units}))
+    elif path.exists():
+        path.unlink()
+
+
 QUEUE = {"id": "-", "owner": "queue", "job": ""}   # history subject for queue-wide events
 
 
@@ -527,6 +554,21 @@ def history(n=5):
     except FileNotFoundError:
         return []
     return [json.loads(l) for l in lines[-n:] if l.strip()]
+
+
+def history_all():
+    """Every history record (for estimates). Bad lines are skipped."""
+    try:
+        text = (STATE / "history.jsonl").read_text()
+    except FileNotFoundError:
+        return []
+    out = []
+    for l in text.splitlines():
+        try:
+            out.append(json.loads(l))
+        except ValueError:
+            pass
+    return out
 
 
 def _compat_path():
@@ -839,7 +881,7 @@ def _place_residents(use, residents):
 def local_snapshot(now):
     with store(write=False) as Q:
         lines, cards = Q["lines"], Q["cards"]
-        use = card_usage(cards, config().get("residents", {}))
+        use = card_usage(cards, fleet.resident_names(config()))
         has_amd = any(c.get("vendor") == "amd" for c in cards.values())
         if use is None or (len(cards) < 2 and not has_amd):
             loaded = gpu_loaded()
@@ -1059,6 +1101,13 @@ def main(argv=None):
     view = argparse.ArgumentParser(add_help=False)   # layout flag, shared by show/watch/tui
     view.add_argument("--mode", choices=["classic", "cards", "bars", "list"], default="classic",
                       help="layout: classic (default), cards, bars, or list")
+    jsonp = argparse.ArgumentParser(add_help=False)  # --json on action commands: one JSON object out
+    jsonp.add_argument("--json", action="store_true",
+                       help="print one JSON object: ok, code, state, message, plus the command's fields")
+    need = argparse.ArgumentParser(add_help=False)   # what a job needs from a card
+    need.add_argument("--vram", type=float, metavar="GB", help="GPU memory the job needs, in GB")
+    need.add_argument("--tag", action="append", default=None, metavar="TAG",
+                      help="card tag the job needs (cuda, rocm, igpu, or your own); repeatable")
     hosts_default = config().get("hosts") or HOST   # config "hosts": comma list; default = this host
     p = sub.add_parser("show", help="print the queue once", parents=[view])
     p.add_argument("--json", action="store_true")
@@ -1071,37 +1120,43 @@ def main(argv=None):
     p = sub.add_parser("tui", help="interactive view: select, reorder, remove")
     p.add_argument("--hosts", default=hosts_default, help="comma-separated (default: %s)" % hosts_default)
     p.add_argument("--every", type=float, default=5, help="seconds between refreshes")
-    p = sub.add_parser("join", help="get in line; prints your id", parents=[card])
-    p.add_argument("--owner", required=True)
-    p.add_argument("--job", required=True,
+    p = sub.add_parser("join", help="get in line; prints your id", parents=[card, need, jsonp])
+    p.add_argument("--spec", metavar="FILE",
+                   help="read the job as a JSON object from FILE (- = stdin): owner, job, why, models,"
+                        " est, max, important, gpu, vram, tags; flags given as well win")
+    p.add_argument("--owner")
+    p.add_argument("--job",
                    help="what the job is — be descriptive; the tui shows it in full, short views trim")
     p.add_argument("--why", default="",
                    help="why it's running / who it's for — a full phrase is fine; shown in full in the tui")
     p.add_argument("--models", default="", help="comma-separated")
-    p.add_argument("--est", type=int, help="expected minutes")
+    p.add_argument("--est", type=int, help="expected minutes (default: the median of this job's past runs)")
     p.add_argument("--max", type=int, help="minutes after which the sweep purges you")
-    p.add_argument("--important", action="store_true",
+    p.add_argument("--important", action="store_true", default=None,
                    help="never jumped by short jobs (default: a job of hours goes ahead of one of days)")
+    p.add_argument("--no-history", action="store_true", help="don't estimate from past runs")
     p = sub.add_parser("edit", help="change an entry's details; id and place are kept"
-                       " (--gpu moves a waiting entry to the end of that card's line)", parents=[card])
+                       " (--gpu moves a waiting entry to the end of that card's line)",
+                       parents=[card, need, jsonp])
     p.add_argument("id")
     for f in ("--job", "--why", "--models"):
         p.add_argument(f)
     p.add_argument("--est", type=int)
     p.add_argument("--max", type=int)
     p.add_argument("--important", action=argparse.BooleanOptionalAction, default=None)
-    p = sub.add_parser("start", help="take the GPU (only as #1)")
+    p = sub.add_parser("start", help="take the GPU (only as #1)", parents=[jsonp])
     p.add_argument("id")
     p.add_argument("--adopt", action="store_true",
                    help="take over a lock file written outside gpuq (backfilling a live job)")
-    p = sub.add_parser("beat", help="heartbeat; at least every 15 min (exit 5 = yield: stop, poll start)")
+    p = sub.add_parser("beat", help="heartbeat; at least every 15 min (exit 5 = yield: stop, poll start)",
+                       parents=[jsonp])
     p.add_argument("id")
     p.add_argument("--progress")
-    p = sub.add_parser("done", help="release the GPU and leave the line")
+    p = sub.add_parser("done", help="release the GPU and leave the line", parents=[jsonp])
     p.add_argument("id")
-    p = sub.add_parser("env", help="print the job's card as CUDA_VISIBLE_DEVICES=GPU-<uuid>")
+    p = sub.add_parser("env", help="print the job's card as CUDA_VISIBLE_DEVICES=GPU-<uuid>", parents=[jsonp])
     p.add_argument("id")
-    p = sub.add_parser("mv", help="move an entry (position or id) to a position", parents=[card])
+    p = sub.add_parser("mv", help="move an entry (position or id) to a position", parents=[card, jsonp])
     p.add_argument("src")
     p.add_argument("dst")
     p = sub.add_parser("run", help="hold the GPU for CMD: start, beat, stop on yield, rerun at #1, done",
@@ -1115,10 +1170,12 @@ def main(argv=None):
     p.add_argument("--grace", type=float, default=30, help="seconds after SIGTERM before SIGKILL")
     p.add_argument("--on-stop", help="shell command run after CMD is stopped (e.g. unload a model)")
     p.add_argument("--progress-file", help="its last line is sent as --progress with each beat")
-    p = sub.add_parser("yield", help="ask the running job to step back (default to #2)")
+    p.add_argument("--free", action="store_true",
+                   help="free the card's residents (`gpuq free`) once granted; restart what it stopped at the end")
+    p = sub.add_parser("yield", help="ask the running job to step back (default to #2)", parents=[jsonp])
     p.add_argument("id")
     p.add_argument("to", nargs="?")
-    p = sub.add_parser("rm", help="remove an entry (position or id)", parents=[card])
+    p = sub.add_parser("rm", help="remove an entry (position or id)", parents=[card, jsonp])
     p.add_argument("ref")
     sub.add_parser("pause", help="hold the line: nobody may start until resume")
     sub.add_parser("resume", help="release the line; #1 gets a fresh 15 minutes")
@@ -1127,9 +1184,27 @@ def main(argv=None):
     p.add_argument("card", nargs="?", help="card to empty (default: the config default card)")
     p.add_argument("--to", help="card to move residents to (default: the other card)")
     p.add_argument("--dry-run", action="store_true", help="show what would move; change nothing")
-    p = sub.add_parser("restore", help="undo an evac: put resident services back on their home card")
+    p = sub.add_parser("restore", help="undo an evac or a free: residents back on their home card, running")
     p.add_argument("card", nargs="?")
     p.add_argument("--dry-run", action="store_true", help="show what would change; change nothing")
+    p = sub.add_parser("free", help="release a card's resident memory: unload models, or stop units")
+    p.add_argument("card", nargs="?", help="card (default: the host default)")
+    p.add_argument("--dry-run", action="store_true", help="show what would be done; change nothing")
+    p = sub.add_parser("inventory", help="what every card offers: usable memory, tags, residents, wait")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--hosts", default=hosts_default, help="comma-separated (default: %s)" % hosts_default)
+    p.add_argument("--local", action="store_true", help="this host only")
+    p = sub.add_parser("where", help="which card, on which host, can take a job — and how soon",
+                       parents=[need])
+    p.add_argument("--est", type=int, help="the job's minutes (applies the short-job jump to the wait)")
+    p.add_argument("--important", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--hosts", default=hosts_default, help="comma-separated (default: %s)" % hosts_default)
+    p.add_argument("--local", action="store_true", help="this host only")
+    p = sub.add_parser("init", help="write a starter config from the cards (and servers) found here")
+    p.add_argument("--print", action="store_true", help="print it; write nothing")
+    p.add_argument("--force", action="store_true", help="replace an existing config (kept as .bak)")
+    sub.add_parser("mcp", help="serve the queue to AI agents over MCP (stdio)")
     # everything after the first "--" is gpuq run's command, never gpuq's own options
     head, run_cmd = (argv[:argv.index("--")], argv[argv.index("--") + 1:]) if "--" in argv else (argv, [])
     args = ap.parse_args(head)
@@ -1139,11 +1214,30 @@ def main(argv=None):
         return _forward(argv, args.host)
 
     now = float(os.environ.get("GPUQ_NOW") or time.time())
+    as_json = getattr(args, "json", False) and args.cmd in ACTION_JSON
+    args.result = {}
     try:
-        return _run(args, now)
+        rc = _run(args, now)
     except QueueError as err:
-        print("gpuq: %s" % err, file=sys.stderr)
+        if as_json:
+            print(json.dumps({"ok": False, "code": err.code, "state": state_name(args.cmd, err.code),
+                              "message": str(err)}))
+        else:
+            print("gpuq: %s" % err, file=sys.stderr)
         return err.code
+    if as_json:
+        print(json.dumps(dict({"ok": rc == 0, "code": rc, "state": state_name(args.cmd, rc)},
+                              **args.result)))
+    return rc
+
+
+ACTION_JSON = {"join", "edit", "start", "beat", "done", "env", "mv", "yield", "rm"}
+STATES = {"start": {0: "go", 3: "wait", 4: "gone"}, "beat": {0: "ok", 4: "purged", 5: "yield"}}
+
+
+def state_name(cmd, code):
+    """The word for an exit code, as --json and MCP report it."""
+    return STATES.get(cmd, {}).get(code) or ("ok" if code == 0 else "error")
 
 
 def _run(args, now):
@@ -1180,6 +1274,21 @@ def _run(args, now):
         return _evac(args, now)
     if cmd == "restore":
         return _restore(args, now)
+    if cmd == "free":
+        return _free(args, now)
+    if cmd == "inventory":
+        return _inventory(args, now)
+    if cmd == "where":
+        return _where(args, now)
+    if cmd == "init":
+        return _init(args, now)
+    if cmd == "mcp":
+        from .mcp import serve
+        return serve()
+    res = getattr(args, "result", {})
+    as_json = getattr(args, "json", False)
+    if cmd == "join":
+        _load_spec(args)
     with store() as Q:
         lines, cards = Q["lines"], Q["cards"]
         multi = len(lines) > 1
@@ -1202,16 +1311,50 @@ def _run(args, now):
             return " on the %s" % next(n for n, x in lines.items() if x is q) if multi else ""
 
         if cmd == "join":
-            models = [m.strip() for m in args.models.split(",") if m.strip()]
-            name = args.gpu or config().get("owners", {}).get(args.owner) or Q["default"]
+            models = [m.strip() for m in (args.models or "").split(",") if m.strip()]
+            cfg = config()
+            est, est_from = args.est, "given" if args.est else None
+            if est is None and not args.no_history:
+                got = fleet.estimate(history_all(), args.job, args.owner)
+                if got:
+                    est, est_from = got[0], "history: median of %d run%s" % (got[1], "s" * (got[1] != 1))
+                    print("estimate from history: ~%s (%s)" % (fmt_dur(est * 60), est_from), file=sys.stderr)
+            tags = args.tag or []
+            prefer = cfg.get("owners", {}).get(args.owner)
+            if args.gpu:
+                name = args.gpu
+                line_named(name)
+                if args.vram or tags:
+                    inv = _inv_local(Q, cfg, now)
+                    ok, why = fleet.fits(inv[name], args.vram, tags)
+                    if not ok:
+                        raise QueueError(2, "the %s can't take it (%s) — see `gpuq where%s`"
+                                         % (name, why, _need_flags(args)))
+            elif args.vram or tags:
+                inv = _inv_local(Q, cfg, now)
+                rows = fleet.rank(inv, lines, now, args.vram, tags, est, bool(args.important), prefer)
+                if not rows or not rows[0][1]:
+                    raise QueueError(2, "no card here fits (%s) — `gpuq where%s` looks on every host"
+                                     % ("; ".join("%s: %s" % (r[0], r[2]) for r in rows) or "no cards",
+                                        _need_flags(args)))
+                name = rows[0][0]
+            else:
+                name = prefer or Q["default"]
             q = line_named(name)
             taken = {x["id"] for other in lines.values() for x in other}
-            e = join(q, now, args.owner, args.job, args.why, models, args.est, args.max,
+            e = join(q, now, args.owner, args.job, args.why or "", models, est, args.max,
                      bool(args.important), taken=taken)
             e["gpu"] = name
+            if args.vram:
+                e["vram_gb"] = args.vram
+            if tags:
+                e["tags"] = tags
             log(now, "joined", e, "#%d%s" % (len(q), where(q)))
-            _jump(q, now, e)
-            print(e["id"])
+            jumped = _jump(q, now, e)
+            res.update(id=e["id"], gpu=name, position=q.index(e) + 1, est_min=est,
+                       est_from=est_from, jumped=jumped)
+            if not as_json:
+                print(e["id"])
         elif cmd == "start":
             q = line_of(args.id, by_id=True)
             if paused_state() and q[find(q, args.id, by_id=True)]["state"] == "waiting":
@@ -1231,11 +1374,17 @@ def _run(args, now):
             write_compat(e)
             if was != "running":
                 log(now, "started", e, "adopted a live job" if args.adopt else where(q).strip())
-            if multi and card_env(Q, args.id):
-                print(card_env(Q, args.id))
+            pin = card_env(Q, args.id)
+            res.update(id=e["id"], gpu=e.get("gpu") or Q["default"],
+                       env=dict([pin.split("=", 1)]) if pin else {})
+            if multi and pin and not as_json:
+                print(pin)
         elif cmd == "env":
             line_of(args.id, by_id=True)
-            print(card_env(Q, args.id) or "")
+            pin = card_env(Q, args.id)
+            res["env"] = dict([pin.split("=", 1)]) if pin else {}
+            if not as_json:
+                print(pin or "")
         elif cmd == "edit":
             q = line_of(args.id)
             e = q[find(q, args.id)]
@@ -1247,6 +1396,10 @@ def _run(args, now):
                 e["models"] = [m.strip() for m in args.models.split(",") if m.strip()]
             if args.important is not None:
                 e["important"] = args.important
+            if args.vram is not None:
+                e["vram_gb"] = args.vram
+            if args.tag is not None:
+                e["tags"] = args.tag
             if args.gpu and lines.get(args.gpu) is not q:
                 if e["state"] != "waiting":
                     raise QueueError(2, "%s is %s — it can change cards only while waiting"
@@ -1260,12 +1413,17 @@ def _run(args, now):
             log(now, "edited", e, where(q).strip())
             if args.est is not None or args.important is not None or args.gpu:
                 _jump(q, now, e)
+            res.update(id=e["id"], gpu=e.get("gpu"), position=q.index(e) + 1)
         elif cmd == "beat":
-            beat(line_of(args.id, by_id=True), now, args.id, args.progress)
+            q = line_of(args.id, by_id=True)
+            res["id"] = args.id
+            e = beat(q, now, args.id, args.progress)
+            res["position"] = q.index(e) + 1
         elif cmd == "done":
             e = done(line_of(args.id, by_id=True), now, args.id)
             clear_compat(e["id"])
             log(now, "done", e)
+            res["id"] = e["id"]
         elif cmd in ("mv", "yield"):
             if cmd == "yield":
                 q = line_of(args.id, by_id=True)
@@ -1345,6 +1503,15 @@ def _hold(args):
             return None
 
     proc = None
+    freed = []      # units this run stopped with --free: started again when it ends
+
+    def unfree():
+        if freed:
+            say("restarting what --free stopped: %s" % ", ".join(freed))
+            _restart_all(freed, "start")
+            left = read_freed()
+            write_freed({u: c for u, c in left.items() if u not in freed})
+            freed.clear()
 
     def on_signal(signum, frame):
         raise KeyboardInterrupt
@@ -1359,6 +1526,10 @@ def _hold(args):
             env = dict(os.environ)
             with store(write=False) as Q:
                 pin = card_env(Q, args.id) if len(Q["lines"]) > 1 else None
+                mine = next((n for n, q in Q["lines"].items() if any(e["id"] == args.id for e in q)), None)
+            if args.free and mine:
+                _, stopped = free_card(mine, config(), say=lambda t: say(t.strip()))
+                freed.extend(u for u in stopped if u not in freed)
             if pin:
                 env[pin.partition("=")[0]] = pin.partition("=")[2]
             say("granted%s, running: %s" % (" (%s)" % pin if pin else "", shlex.join(cmd)))
@@ -1377,11 +1548,13 @@ def _hold(args):
                 code, proc = proc.returncode, None
                 gq("done", args.id)
                 say("finished (exit %d), released the GPU" % code)
+                unfree()
                 return code
             stop(proc)
             proc = None
             if rc == 4:
                 say("purged from the queue — stopped")
+                unfree()
                 return 4
             say("yielded — stopped, waiting for the GPU again")
     except KeyboardInterrupt:
@@ -1389,7 +1562,207 @@ def _hold(args):
             stop(proc)
         gq("done", args.id)
         say("interrupted — stopped and left the line")
+        unfree()
         return 130
+
+
+def _load_spec(args):
+    """join --spec FILE|-: fill the flags from a JSON object; a flag given on the command line wins."""
+    if args.spec:
+        try:
+            spec = json.load(sys.stdin if args.spec == "-" else open(args.spec))
+        except (OSError, ValueError) as err:
+            raise QueueError(2, "--spec: %s" % err)
+        if not isinstance(spec, dict):
+            raise QueueError(2, "--spec: expected a JSON object")
+        keys = {"owner": "owner", "job": "job", "why": "why", "models": "models", "est": "est",
+                "est_min": "est", "max": "max", "max_min": "max", "important": "important",
+                "gpu": "gpu", "vram": "vram", "vram_gb": "vram", "tags": "tag", "tag": "tag"}
+        for k, v in spec.items():
+            if k not in keys:
+                raise QueueError(2, "--spec: unknown key %r (known: %s)" % (k, ", ".join(sorted(keys))))
+            dest = keys[k]
+            if dest == "models" and isinstance(v, list):
+                v = ",".join(v)
+            if dest == "tag" and isinstance(v, str):
+                v = [v]
+            if getattr(args, dest, None) in (None, "", False):
+                setattr(args, dest, v)
+    if not args.owner or not args.job:
+        raise QueueError(2, "join needs --owner and --job (or a --spec with them)")
+
+
+def _need_flags(args):
+    return "".join([" --vram %g" % args.vram] if args.vram else []) + \
+        "".join(" --tag %s" % t for t in args.tag or [])
+
+
+def _inv_local(Q, cfg, now, use=None):
+    return fleet.inventory(Q["cards"], cfg, Q["lines"], now, use, read_evac(), read_freed())
+
+
+def local_inventory(now):
+    cfg = config()
+    with store(write=False) as Q:
+        use = card_usage(Q["cards"], fleet.resident_names(cfg))
+        return _inv_local(Q, cfg, now, use)
+
+
+def _remote_json(host, *args):
+    """(parsed JSON, None) or (None, error) from `gpuq ARGS` on HOST over ssh."""
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host,
+                            remote_cmd() + " " + shlex.join(args)],
+                           capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return None, "%s: no answer within 30 s" % host
+    try:
+        return json.loads(r.stdout), None
+    except ValueError:
+        return None, "%s: %s" % (host, (r.stderr.strip().splitlines() or ["unreachable"])[-1])
+
+
+def _hosts(args):
+    if args.local:
+        return [HOST]
+    return [h.strip() for h in (args.hosts or HOST).split(",") if h.strip()] or [HOST]
+
+
+_gb = fleet.gb
+
+
+def _wait_text(sec):
+    return "unknown" if sec is None else "now" if sec < 60 else "~" + fmt_dur(sec)
+
+
+def _inventory(args, now):
+    out = {}
+    for h in _hosts(args):
+        if h == HOST:
+            out[h] = local_inventory(now)
+        else:
+            got, err = _remote_json(h, "inventory", "--json", "--local")
+            out[h] = got if got is not None else {"error": err}
+    if args.json:
+        print(json.dumps(out if not args.local else out[HOST]))
+        return 0
+    for h, inv in out.items():
+        print(h)
+        if "error" in inv and isinstance(inv["error"], str):
+            print("  " + inv["error"])
+            continue
+        for n, c in inv.items():
+            bits = []
+            if c["reserve_mib"]:
+                bits.append("reserve %s" % _gb(c["reserve_mib"]))
+            if c["resident_mib"]:
+                bits.append("residents %s" % _gb(c["resident_mib"]))
+            if c["cap_mib"] != c["mib"]:
+                bits.append("capped from %s" % _gb(c["mib"]))
+            size = _gb(c["mib"]) + (" shared" if c["integrated"] else "")
+            print("  %-6s %-14s usable %-6s %s" % (n, size, _gb(c["usable_mib"]),
+                                                   "(%s)" % ", ".join(bits) if bits else ""))
+            line = "%d in line, wait %s" % (c["in_line"], _wait_text(c["wait_sec"]))
+            if c["running"]:
+                line += " · running: %s (%s)" % (c["running"]["job"], c["running"]["owner"])
+            print("         tags %s · %s" % (",".join(c["tags"]) or "-", line))
+            if c["residents"]:
+                print("         residents: %s" % ", ".join(c["residents"]))
+    return 0
+
+
+def where_rows(inv, lines, now, vram=None, tags=(), est=None, important=False):
+    rows = []
+    for n, ok, why, wait in fleet.rank(inv, lines, now, vram, tags, est, important):
+        c = inv[n]
+        rows.append({"card": n, "fits": ok, "reason": why, "wait_sec": wait,
+                     "usable_mib": c["usable_mib"], "tags": c["tags"], "in_line": c["in_line"]})
+    return rows
+
+
+def _where(args, now):
+    rows = []
+    for h in _hosts(args):
+        if h == HOST:
+            cfg = config()
+            with store(write=False) as Q:
+                got = where_rows(_inv_local(Q, cfg, now), Q["lines"], now, args.vram,
+                                 args.tag or [], args.est, args.important)
+        else:
+            extra = ([] if args.vram is None else ["--vram", "%g" % args.vram]) + \
+                [x for t in args.tag or [] for x in ("--tag", t)] + \
+                ([] if args.est is None else ["--est", str(args.est)]) + \
+                (["--important"] if args.important else [])
+            got, err = _remote_json(h, "where", "--json", "--local", *extra)
+            if got is None:
+                rows.append({"host": h, "card": None, "fits": False, "reason": err, "wait_sec": None,
+                             "usable_mib": None, "tags": [], "in_line": 0})
+                continue
+        rows.extend(dict(r, host=h) for r in got)
+    big = float("inf")
+    rows.sort(key=lambda r: (not r["fits"], big if r["wait_sec"] is None else r["wait_sec"],
+                             r["host"] != HOST, r["usable_mib"] or 0))
+    if args.json:
+        print(json.dumps([{k: v for k, v in r.items() if not (args.local and k == "host")} for r in rows]))
+        return 0 if any(r["fits"] for r in rows) else 1
+    for r in rows:
+        if r["card"] is None:
+            print("✗ %s" % r["reason"])
+            continue
+        print("%s %-10s %-6s usable %-6s wait %-8s %s" % (
+            "✓" if r["fits"] else "✗", r["host"], r["card"], _gb(r["usable_mib"]),
+            _wait_text(r["wait_sec"]) if r["fits"] else "-", r["reason"] or ",".join(r["tags"])))
+    best = next((r for r in rows if r["fits"]), None)
+    if best:
+        print("→ gpuq%s join --gpu %s%s ..." % ("" if best["host"] == HOST else " --host " + best["host"],
+                                               best["card"], _need_flags(args)))
+        return 0
+    print("nothing fits%s" % ("" if len(_hosts(args)) > 1 else " here — `--hosts a,b` looks further"))
+    return 1
+
+
+def _init(args, now):
+    cfg = config()
+    cards = gpu_cards()
+    use = card_usage(cards, {}) or {}
+    new = dict(cfg)
+    new.setdefault("default", default_card(cards))
+    new.setdefault("hosts", HOST)
+    cc = new.setdefault("cards", {})
+    for n, c in cards.items():
+        cc.setdefault(n, {"reserve_gb": 0, "tags": []})
+        if c.get("integrated"):
+            cc[n].setdefault("vram_gb", round(c["mib"] / 1024 / 2))   # lend half the shared RAM
+    res = new.setdefault("residents", {})
+    known = {r["match"] for r in fleet.residents(new)}
+    for n, u in use.items():
+        for label in u.get("jobs") or []:
+            proc = label.rpartition(" ")[0]
+            for t, pre in fleet.PRESETS.items():
+                if proc == pre["match"] and proc not in known:
+                    res.setdefault(n, []).append({"type": t})
+                    known.add(proc)
+                    break
+    text = json.dumps(new, indent=2) + "\n"
+    if any(isinstance(r, dict) and "vram_gb" not in r and "vram_frac" not in fleet.PRESETS.get(r.get("type"), {})
+           for rs in res.values() for r in rs):
+        print("gpuq: add \"vram_gb\" to each resident so `where` and --vram count what it holds",
+              file=sys.stderr)
+    if args.print:
+        print(text, end="")
+        return 0
+    if CONFIG.exists() and not args.force:
+        print(text, end="")
+        print("gpuq: %s exists — not changed (the merged config is above; --force writes it, keeping a .bak)"
+              % CONFIG, file=sys.stderr)
+        return 1
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    if CONFIG.exists():
+        shutil.copy2(CONFIG, CONFIG.with_suffix(".json.bak"))
+    CONFIG.write_text(text)
+    print("wrote %s — %d card(s): %s. Edit reserve_gb / vram_gb / tags / residents to taste; "
+          "`gpuq inventory` shows the result." % (CONFIG, len(cards), ", ".join(cards) or "none found"))
+    return 0
 
 
 def _note_yields(q, now, before):
@@ -1410,13 +1783,22 @@ def _jump(q, now, e):
         log(now, "jumped", e, note)
         print("jumped to #%d — %s" % (q.index(e) + 1, note), file=sys.stderr)
         _note_yields(q, now, before)
+        return note
+    return None
 
 
 # ---- evacuate / restore: move a card's resident services off it, to free the whole card ----
 
 def _unit_for(proc, cfg):
     """The systemd user unit for a resident process name (config `units`, else <proc>.service)."""
+    for r in fleet.residents(cfg):
+        if proc in (r["name"], r["match"]):
+            return r["unit"]
     return (cfg.get("units") or {}).get(proc) or (proc + ".service")
+
+
+def _units_on(card, cfg):
+    return [r["unit"] for r in fleet.residents(cfg) if r["card"] == card]
 
 
 def _evac_dropin(unit):
@@ -1433,7 +1815,7 @@ def evac_targets(cards, cfg, card=None, to=None):
     to = to or (max(others, key=_size_key(cards)) if others else None)
     if to not in cards:
         raise QueueError(2, "no second card to move residents to")
-    units = [_unit_for(p, cfg) for p in (cfg.get("residents") or {}).get(card, [])]
+    units = _units_on(card, cfg)
     if not units:
         raise QueueError(2, "no resident services configured on the %s (see the config file, 'residents')"
                          % card)
@@ -1444,15 +1826,15 @@ def _systemctl(*a):
     return subprocess.run(["systemctl", "--user", *a], capture_output=True, text=True)
 
 
-def _restart_all(units):
+def _restart_all(units, verb="restart"):
     """daemon-reload, then restart each unit; returns 0, or 1 if any restart failed (printed)."""
     _systemctl("daemon-reload")
     rc = 0
     for u in units:
-        r = _systemctl("restart", u)
+        r = _systemctl(verb, u)
         if r.returncode != 0:
             rc = 1
-            print("  ! restart %s failed: %s" % (u, (r.stderr or "").strip()), file=sys.stderr)
+            print("  ! %s %s failed: %s" % (verb, u, (r.stderr or "").strip()), file=sys.stderr)
     return rc
 
 
@@ -1481,31 +1863,97 @@ def _evac(args, now):
 def _restore(args, now):
     st = read_evac()
     cfg = config()
+    freed = read_freed()
+    stopped = [u for u, c in freed.items() if not args.card or c == args.card]
     card = args.card or (st or {}).get("card") or cfg.get("default")
-    units = (st or {}).get("units") or [_unit_for(p, cfg)
-                                        for p in (cfg.get("residents") or {}).get(card, [])]
-    if not units:
+    units = []
+    if st or not stopped:      # an evac to undo (or, with nothing freed, the old default)
+        units = (st or {}).get("units") or _units_on(card, cfg)
+    if not units and not stopped:
         raise QueueError(2, "nothing to restore")
-    print("restore: put residents back on the %s" % card)
-    for u in units:
-        print("  %s → drop the override, then restart" % u)
+    if units:
+        print("restore: put residents back on the %s" % card)
+        for u in units:
+            print("  %s → drop the override, then restart" % u)
+    for u in stopped:
+        print("  %s → start again (stopped by `gpuq free`)" % u)
     if args.dry_run:
         print("(dry run — nothing changed)")
         return 0
-    for u in units:
-        d = _evac_dropin(u)
+    rc = 0
+    if units:
+        for u in units:
+            d = _evac_dropin(u)
+            try:
+                d.unlink()
+                if not any(d.parent.iterdir()):
+                    d.parent.rmdir()
+            except OSError:
+                pass
+        rc = _restart_all(units)
         try:
-            d.unlink()
-            if not any(d.parent.iterdir()):
-                d.parent.rmdir()
+            (STATE / "evac.json").unlink()
         except OSError:
             pass
-    rc = _restart_all(units)
-    try:
-        (STATE / "evac.json").unlink()
-    except OSError:
-        pass
-    print("residents back on the %s" % card)
+        print("residents back on the %s" % card)
+    if stopped:
+        rc = _restart_all(stopped, "start") or rc
+        write_freed({u: c for u, c in freed.items() if u not in stopped})
+    return rc
+
+
+# ---- free: release a card's resident memory without moving anything ----
+
+def free_card(card, cfg, dry_run=False, say=print):
+    """Release what the residents of CARD hold: unload models (ollama, llama-swap), stop units
+    (`free: "stop"`, vLLM, llama-server) or run the resident's own `free` shell command.
+    Returns (rc, units stopped). Residents without a way to free them are reported, not touched."""
+    rc, stopped = 0, []
+    here = [r for r in fleet.residents(cfg) if r["card"] == card]
+    if not here:
+        say("free: no residents configured on the %s" % card)
+        return 0, []
+    for r in here:
+        how = r.get("free")
+        if not how:
+            say("  %s: no way to free it declared (set \"type\" or \"free\") — left alone" % r["name"])
+            continue
+        if how in ("ollama", "llama-swap"):
+            say("  %s: unload models over HTTP (%s)" % (r["name"], r.get("url")))
+            if dry_run:
+                continue
+            try:
+                got = (fleet.ollama_unload if how == "ollama" else fleet.llamaswap_unload)(r["url"])
+                say("    unloaded: %s" % (", ".join(got) or "nothing was loaded"))
+            except (OSError, ValueError) as err:
+                rc = 1
+                say("    ! %s: %s" % (r["name"], err))
+        elif how == "stop":
+            say("  %s: stop %s (restore starts it)" % (r["name"], r["unit"]))
+            if dry_run:
+                continue
+            res = _systemctl("stop", r["unit"])
+            if res.returncode:
+                rc = 1
+                say("    ! stop failed: %s" % (res.stderr or "").strip())
+            else:
+                stopped.append(r["unit"])
+        else:
+            say("  %s: run %s" % (r["name"], how))
+            if not dry_run and subprocess.run(how, shell=True).returncode:
+                rc = 1
+    if stopped:
+        f = read_freed()
+        f.update({u: card for u in stopped})
+        write_freed(f)
+    return rc, stopped
+
+
+def _free(args, now):
+    cfg = config()
+    card = args.card or default_card(gpu_cards())
+    print("free: release the residents' memory on the %s%s" % (card, " (dry run)" if args.dry_run else ""))
+    rc, _ = free_card(card, cfg, args.dry_run)
     return rc
 
 

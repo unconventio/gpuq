@@ -1,8 +1,20 @@
 {
   "default": "3090",
   "owners": {"nightly-eval": "3060"},
-  "residents": {"3060": ["voice-dictation", "whisper-server"]},
-  "units": {"voice-dictation": "dictation.service"},
+  "cards": {
+    "3090": {"reserve_gb": 1, "tags": ["fast"]},
+    "3060": {"reserve_gb": 0.5, "tags": []},
+    "880M": {"vram_gb": 12}
+  },
+  "residents": {
+    "3060": [
+      "whisper-server",
+      {"type": "ollama", "vram_gb": 6, "url": "http://127.0.0.1:11434"},
+      {"name": "voice-dictation", "unit": "dictation.service", "vram_gb": 2}
+    ],
+    "3090": [{"type": "vllm", "unit": "vllm-chat.service", "vram_gb": 20}]
+  },
+  "units": {"whisper-server": "whisper.service"},
   "hosts": "workstation,laptop",
   "remote_command": "~/.local/bin/gpuq",
   "compat_lock": "~/GPU-LOCK.txt"
