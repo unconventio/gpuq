@@ -618,11 +618,25 @@ def screen_summary(views, hosts, now, width, focus, flagged=()):
         if total <= width - 1 and widths[heads.index("NOW")] >= want:
             break
     out = [(fmt(heads).rstrip(), "dim")]
+    col = {hd: 2 + sum(widths[:i]) + 2 * i for i, hd in enumerate(heads)}
     for vi, (r, f) in enumerate(zip(table, rows)):
         line = fmt(r).rstrip()
+        # color, sparingly: red ⚠ = needs you, yellow = watch it, green = free now; the
+        # focused GPU is the one whose name is bold (the rule below repeats it)
+        spans = []
         if vi in flagged:               # ⚠ in the margin: this GPU has an alert below
             line = "⚠" + line[1:]
-        out.append((line[:max(width - 1, 0)], "%s|b2:%d" % (f["st"], 2 + len(f["name"]))))
+            spans.append("r0:1")
+        if f["st"].endswith("s"):
+            spans.append("b2:%d" % (2 + len(f["name"])))
+        fr = col["FREES"]
+        if f["frees"] == "now":
+            spans.append("g%d:%d" % (fr, fr + 3))
+        elif f["frees"] in ("over", "soon"):
+            spans.append("y%d:%d" % (fr, fr + 4))
+        if f["used"] is not None and f["gib"] and f["used"] / f["gib"] >= 0.95:
+            spans.append("y%d:%d" % (col["MEM"], col["MEM"] + widths[heads.index("MEM")]))
+        out.append((line[:max(width - 1, 0)], f["st"] + "".join("|" + x for x in spans)))
     return out
 
 
@@ -674,7 +688,7 @@ def tui_screen(views, sel_host, sel_row, now, width=80):
         is_sel = i == sel_row
         if is_sel:
             sel = (i, e)
-        L.append((_trim(line, width - 1), "sel" if is_sel else "run" if run else "warn" if yld else "wait"))
+        L.append((_trim(line, width - 1), "sel" if is_sel else "warn" if yld else "wait"))
         bits = [timing]
         if run or yld:
             bits.append("beat %s ago" % fmt_dur(now - (e["heartbeat"] or e["started"])))
@@ -691,7 +705,7 @@ def tui_screen(views, sel_host, sel_row, now, width=80):
         L.append(("", ""))
         L.append((_trim(" ┄ " + " · ".join(bits), width - 1), "dim"))
         if e["state"] == "waiting":
-            L.append((_trim("   " + _blocked(snap, q, i, now), width - 1), "warn"))
+            L.append((_trim("   " + _blocked(snap, q, i, now), width - 1), "wait"))
         if e.get("why"):
             L.append((_trim("   why: " + e["why"], width - 1), "dim"))
     info = [w for w in warnings(snap) if not w.startswith("⚠")]
@@ -1320,7 +1334,7 @@ TUI_HELP = """GPU Queue — help                                         any key
 
 KEYS
   ↑ ↓          select a job in the GPU's line below
-  ← → / Tab    switch GPU (the summary row in full brightness is the one shown)
+  ← → / Tab    switch GPU (the GPU with the bold name is the one shown)
   k / Shift-↑  move the selected job up, sooner;  j / Shift-↓  down, later.
                Moving the running job down asks it to yield: it stops at its next
                heartbeat, waits, and resumes when it is #1 again.
@@ -1344,8 +1358,14 @@ MARKS
   blank = normal (10). Higher priority goes first; outranking the running job
   makes it yield. Short jobs may pass normal and chill jobs, never important ones.
 
-COLORS
-  green running · yellow yielding · red needs you · dim detail""".splitlines()
+COLORS  (always next to a word or symbol that says the same)
+  red ⚠      needs you
+  yellow     temporary, watch it: yielding, over its estimate, memory nearly full
+  green now  free now: a job could start on that GPU
+  bold name  the GPU whose line is shown below
+  dim        detail""".splitlines()
+HELP_COLORS = [("red ⚠", "r"), ("yellow", "y"), ("green now", "g"), ("bold name", "b"), ("⚠", "r"),
+               ("⚑", "b"), ("over", "y"), ("soon", "y"), ("⏏", "y")]
 
 
 # Shift-↑/↓ as raw escape sequences, for terminals whose terminfo doesn't decode them
@@ -1362,29 +1382,29 @@ def _tui(args):
     def loop(scr):
         curses.curs_set(0)
         curses.use_default_colors()
-        # color has meaning: green = running, yellow = yielding, red = needs a human,
-        # dim = detail; machines get their own colors from a palette that avoids those three
-        curses.init_pair(1, curses.COLOR_GREEN, -1)
-        curses.init_pair(2, curses.COLOR_YELLOW, -1)
-        curses.init_pair(3, curses.COLOR_RED, -1)
-        # bold: the title and GPU names; reverse video: the title, the selected job, the key bar. for the selected job and the key bar
+        # Three colors, one meaning each, always beside a word or symbol that says the same:
+        # red + ⚠ = needs you, yellow (bold, for light themes) = temporary, watch it,
+        # green = free now. NO_COLOR or a colorless terminal: bold/reverse only.
+        colors = curses.has_colors() and not os.environ.get("NO_COLOR")
+        if colors:
+            curses.init_pair(1, curses.COLOR_GREEN, -1)
+            curses.init_pair(2, curses.COLOR_YELLOW, -1)
+            curses.init_pair(3, curses.COLOR_RED, -1)
+        green = curses.color_pair(1) if colors else curses.A_BOLD
+        yellow = (curses.color_pair(2) if colors else 0) | curses.A_BOLD
+        red = (curses.color_pair(3) if colors else 0) | curses.A_BOLD
+        span_attr = {"b": curses.A_BOLD, "g": green, "y": yellow, "r": red}
+        # bold: the title and the focused GPU's name; reverse: the title, the selected job, the key bar
         style = {"title": curses.A_BOLD | curses.A_REVERSE, "head": curses.A_UNDERLINE,
-                 "run": curses.color_pair(1), "sel": curses.A_REVERSE,
-                 "warn": curses.color_pair(2), "alert": curses.color_pair(3),
+                 "run": curses.A_NORMAL, "sel": curses.A_REVERSE,
+                 "warn": yellow, "alert": red,
                  "wait": curses.A_NORMAL, "dim": curses.A_DIM, "dimhead": curses.A_DIM,
                  "": curses.A_NORMAL}
-        pal = [curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_BLUE,
-               curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_BLUE]
-        for i, c in enumerate(pal):
-            curses.init_pair(11 + i, c, -1)
 
         def resolve(st):
             """A fixed style name, or a GPU-colored header key 'h<idx>' (+ 's' when focused)."""
             if len(st) >= 2 and st[0] in "hm" and st[1].isdigit():
-                # no per-machine colors: the shown GPU's summary row is plain, the others dim
-                if st[0] == "m" and not st.endswith("s"):
-                    return curses.A_DIM
-                return curses.A_NORMAL
+                return curses.A_NORMAL      # summary rows and the rule: plain, never dimmed
             return style.get(st, curses.A_NORMAL)
         scr.timeout(250)
         views, fetched, sh, sr, msg = fetch_views(hosts), time.time(), 0, 0, ""
@@ -1407,14 +1427,24 @@ def _tui(args):
             card = (views[sh][1] or {}).get("card")
             return ["--gpu", card] if card else []
 
-        def put(y, text, attr, bold=None):
+        def put(y, text, attr, spans=()):
+            """Draw a line, then overlay its spans: (kind, a, b) with kind b/g/y/r."""
             try:
                 scr.addnstr(y, 0, text.ljust(w), w - 1, attr)
-                if bold and bold[0] < w - 1:
-                    a, b = bold
-                    scr.addnstr(y, a, text[a:b], max(min(b, w - 1) - a, 0), attr | curses.A_BOLD)
+                for kind, a, b in spans:
+                    if a < w - 1:
+                        scr.addnstr(y, a, text[a:b], max(min(b, w - 1) - a, 0), attr | span_attr[kind])
             except curses.error:
                 pass
+
+        def parse(st):
+            st, *rest = st.split("|")
+            spans = []
+            for x in rest:
+                a, _, b = x[1:].partition(":")
+                if x[:1] in span_attr and a.isdigit() and b.isdigit():
+                    spans.append((x[0], int(a), int(b)))
+            return st, spans
 
         while True:
             if time.time() - fetched >= args.every:
@@ -1423,9 +1453,8 @@ def _tui(args):
             h, w = scr.getmaxyx()
             scr.erase()
             for y, (text, st) in enumerate(tui_screen(views, sh, sr, time.time(), w)[:h - 1]):
-                st, _, span = st.partition("|")
-                bold = tuple(int(x) for x in span[1:].split(":")) if span.startswith("b") else None
-                put(y, text, resolve(st), bold)
+                st, spans = parse(st)
+                put(y, text, resolve(st), spans)
             put(h - 1, msg or TUI_KEYS, curses.A_REVERSE)
             scr.refresh()
             k = scr.getch()
@@ -1454,7 +1483,11 @@ def _tui(args):
             elif k == ord("?"):
                 scr.erase()
                 for y, text in enumerate(TUI_HELP[:h]):
-                    put(y, " " + text, curses.A_BOLD if y == 0 or text.isupper() else curses.A_NORMAL)
+                    line = " " + text
+                    spans = [(k, line.find(word), line.find(word) + len(word)) for word, k in HELP_COLORS
+                             if word in line]
+                    put(y, line, curses.A_REVERSE | curses.A_BOLD if y == 0 else
+                        curses.A_BOLD if text.isupper() else curses.A_NORMAL, spans)
                 scr.refresh()
                 scr.timeout(-1)
                 scr.getch()
