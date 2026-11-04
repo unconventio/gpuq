@@ -345,3 +345,21 @@ import unittest.mock  # noqa: E402
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Display(unittest.TestCase):
+    def test_model_names(self):
+        from gpuq import cli as g
+        self.assertEqual(g.nvidia_model("NVIDIA GeForce RTX 3090"), "RTX 3090")
+        self.assertEqual(g.amd_model("Strix [Radeon 880M / 890M]"), "Radeon 880M")
+
+    def test_summary_row_per_gpu(self):
+        from gpuq import cli as g
+        snap = {"host": "a", "entries": [], "card": None, "meters": {"3090": {"used_mib": 12288, "util": 50}},
+                "cards": {"3090": {"mib": 24576, "model": "RTX 3090"}}}
+        (text, st), = g.summary_lines([("a", snap, None)], ["a"])
+        self.assertIn("RTX 3090", text)
+        self.assertIn("@ a", text)
+        self.assertIn("█████░░░░░", text)
+        self.assertIn("idle", text)
+        self.assertEqual(st, "m0")

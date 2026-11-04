@@ -114,18 +114,36 @@ def per_card(snap):
 def header(snap, now):
     q = snap["entries"]
     where = snap["host"]
-    if snap.get("card"):
-        c = (snap.get("cards") or {}).get(snap["card"]) or {}
+    cards = snap.get("cards") or {}
+    card = snap.get("card") or (next(iter(cards)) if len(cards) == 1 else None)
+    if card:
+        c = cards.get(card) or {}
         gib = c.get("mib")
-        where += " %s%s" % (snap["card"], " (%d GB%s)" % (round(gib / 1024), " shared" if c.get("integrated") else "")
-                            if gib else "")
-    text = "%s · %s · %s" % (where, fmt_clock(now, now),
-                             "%d in line" % len(q) if q else "queue empty")
+        where += " · %s%s" % (c.get("model") or card,
+                              " (%d GB%s)" % (round(gib / 1024), " shared" if c.get("integrated") else "")
+                              if gib else "")
+    # machine and card, then the running job in brief: who/what, model, ETA; its id goes last
+    r = q[0] if q and q[0]["state"] in ("running", "yielding") else None
+    if r:
+        text = "%s · %s %s: %s" % (where, "▶" if r["state"] == "running" else "⏏",
+                                   r["owner"][:12], _trim(r["job"], 28))
+        if r["models"]:
+            text += " · " + ",".join(r["models"])
+        if r.get("est_min") and r.get("started"):
+            end = r["started"] + r["est_min"] * 60
+            text += (" · ends ~%s" % fmt_clock(end, now) if end > now
+                     else " · %s over its estimate" % fmt_dur(now - end))
+        if len(q) > 1:
+            text += " · +%d waiting" % (len(q) - 1)
+    else:
+        text = "%s · %s" % (where, "%d in line" % len(q) if q else "queue empty")
     if snap.get("paused"):
         text += " · ⏸ PAUSED since %s — nobody may start" % fmt_clock(snap["paused"]["since"], now)
     ev = snap.get("evac")
     if ev and ev.get("card") == snap.get("card"):
         text += " · ⏏ EVACUATED → %s" % ev.get("to")
+    if r:
+        text += " · %s" % r["id"]
     return text
 
 
@@ -138,8 +156,10 @@ def entry_timings(q, now):
             elapsed = now - e["started"]
             if e.get("est_min"):
                 cursor = now + max(e["est_min"] * 60 - elapsed, 0)
-                t = "%s of ~%s, ends ~%s" % (fmt_dur(elapsed), fmt_dur(e["est_min"] * 60),
-                                             fmt_clock(cursor, now))
+                over = elapsed - e["est_min"] * 60
+                t = "%s of ~%s, %s" % (fmt_dur(elapsed), fmt_dur(e["est_min"] * 60),
+                                       "%s over, end unknown" % fmt_dur(over) if over > 0
+                                       else "ends ~%s" % fmt_clock(cursor, now))
             else:
                 cursor, t = None, "%s so far, no estimate" % fmt_dur(elapsed)
         elif e["state"] == "yielding":
@@ -147,8 +167,12 @@ def entry_timings(q, now):
         else:
             est = "~%s" % fmt_dur(e["est_min"] * 60) if e.get("est_min") else "no estimate"
             if cursor is not None:
-                t = "%s, starts ~%s" % (est, fmt_clock(cursor, now))
+                start = fmt_clock(cursor, now)
                 cursor = cursor + e["est_min"] * 60 if e.get("est_min") else None
+                if cursor is not None:
+                    t = "%s, ends ~%s (starts ~%s)" % (est, fmt_clock(cursor, now), start)
+                else:
+                    t = "%s, starts ~%s, ends: unknown" % (est, start)
             else:
                 t = "%s, starts: unknown" % est
             if e.get("skips"):
@@ -326,6 +350,50 @@ def fmt_event(h, now):
                                 " — " + h["note"] if h.get("note") else "")
 
 
+def _bar(frac, n=10):
+    if frac is None:
+        return "·" * n
+    k = max(0, min(n, round(frac * n)))
+    return "█" * k + "░" * (n - k)
+
+
+def summary_lines(views, hosts):
+    """One line per GPU across the fleet: name, size, machine, what runs on it, memory and
+    utilisation bars. Styled in the machine's colour."""
+    rows = []
+    for host, snap, err in views:
+        idx = hosts.index(host) % 6
+        if err or snap is None:
+            rows.append((["?", "", "@ " + host, "", "", "unreachable"], "m%d" % idx))
+            continue
+        cards = snap.get("cards") or {}
+        card = snap.get("card") or (next(iter(cards)) if len(cards) == 1 else None)
+        c = cards.get(card) or {}
+        gib = c.get("mib")
+        size = "%d GB%s" % (round(gib / 1024), " shared" if c.get("integrated") else "") if gib else ""
+        m = (snap.get("meters") or {}).get(card) or {}
+        used, util = m.get("used_mib"), m.get("util")
+        mem = "mem %s %s" % (_bar(used / gib if used is not None and gib else None),
+                             "%4.1f GB" % (used / 1024) if used is not None else "   ? ")
+        gpu = "gpu %s %s" % (_bar(util / 100 if util is not None else None),
+                             "%3d%%" % util if util is not None else "  ?")
+        q = snap["entries"]
+        r = q[0] if q and q[0]["state"] in ("running", "yielding") else None
+        if r:
+            what = "%s %s (%s)" % ("▶" if r["state"] == "running" else "⏏",
+                                   ",".join(r["models"]) or _trim(r["job"], 24), r["owner"][:12])
+        else:
+            what = "idle" if not q else "%d waiting" % len(q)
+        rows.append(([c.get("model") or card or host, size, "@ " + host, mem, gpu, what], "m%d" % idx))
+    widths = [max(len(r[0][i]) for r in rows) for i in range(5)] if rows else []
+    return [("  " + "  ".join(f.ljust(widths[i]) for i, f in enumerate(cols[:5])) + "   " + cols[5], st)
+            for cols, st in rows]
+
+
+IND = " " * 8           # TUI: card info and jobs sit a tab in under the card's rule
+DET = IND + " " * 7     # a job's detail lines, under its owner
+
+
 def tui_lines(views, sel_host, sel_row, now, width=80):
     """Screen content for the TUI as [(text, style)]. One roomy, colour-coded block per GPU,
     showing its full listing: a coloured header (the focused host's style ends in "s", and your
@@ -334,8 +402,16 @@ def tui_lines(views, sel_host, sel_row, now, width=80):
     Styles: run / sel / warn / dim / head / "" / "h<idx>" (+ "s" when focused).
     views = [(host, snap or None, error or None)]."""
     L, selected = [], None
+    hosts = list(dict.fromkeys(v[0] for v in views))
+    title = " GPU queue "
+    if len(hosts) > 1:
+        title += "· " + ", ".join(hosts) + " "
+    L.append((title, "title"))
+    L.append(("", ""))
+    L.extend(summary_lines(views, hosts))
+    L.append(("", ""))
     for hi, (host, snap, err) in enumerate(views):
-        idx = hi % 6
+        idx = hosts.index(host) % 6     # one colour per machine, its cards share it
         focus = hi == sel_host
         mark = "▸ " if focus else "  "       # which host the keys act on
         hstyle = "h%ds" % idx if focus else "h%d" % idx
@@ -348,21 +424,24 @@ def tui_lines(views, sel_host, sel_row, now, width=80):
         base = header(snap, now)
         rule = "─" * max(2, width - len(mark) - len(base) - len(you) - 2)
         L.append((mark + base + " " + rule + you, hstyle))
+        L.append(("", ""))
         for w in warnings(snap):
-            L.append(("    " + w, "warn" if w.startswith("⚠") else "dim"))
+            L.append((IND + w, "alert" if w.startswith("⚠") else "dim"))
         if not q:
-            L.append(("    queue empty", "dim"))
+            L.append((IND + "queue empty", "dim"))
+        elif warnings(snap):
+            L.append(("", ""))
         for i, (e, timing) in enumerate(entry_timings(q, now)):
             run, yld = e["state"] == "running", e["state"] == "yielding"
             sel = focus and i == sel_row
             if sel:
                 selected = (snap, e)
-            prim = "%2d %s%s %s" % (i + 1, "▶" if run else "⏏" if yld else " ",
+            prim = IND + "%2d %s%s %s" % (i + 1, "▶" if run else "⏏" if yld else " ",
                                     "★" if e.get("important") else " ", e["owner"])
             if e["job"]:
                 prim += "  —  " + e["job"]
-            L.append((prim, "sel" if sel else "run" if run else "warn" if yld else ""))
-            det = "       %s · %s" % (",".join(e["models"]) or "-", timing)
+            L.append((prim, "sel" if sel else "run" if run else "warn" if yld else "wait"))
+            det = DET + "%s · %s" % (",".join(e["models"]) or "-", timing)
             if e["state"] in ("running", "yielding"):
                 det += " · beat %s ago" % fmt_dur(now - (e["heartbeat"] or e["started"]))
             if e.get("progress"):
@@ -372,9 +451,10 @@ def tui_lines(views, sel_host, sel_row, now, width=80):
                 bits = ["id %s" % e["id"], "joined %s" % fmt_clock(e["joined"], now)]
                 if e.get("max_min"):
                     bits.append("max %s" % fmt_dur(e["max_min"] * 60))
-                L.append(("       " + " · ".join(bits), "dim"))
+                L.append((DET + " · ".join(bits), "dim"))
             if e.get("why"):
-                L.append(("       why: %s" % e["why"], "dim"))
+                L.append((DET + "why: %s" % e["why"], "dim"))
+        L.append(("", ""))
         L.append(("", ""))
     foc = views[sel_host] if 0 <= sel_host < len(views) else None
     hist = (foc[1] or {}).get("history") if foc and foc[1] else None
@@ -412,6 +492,18 @@ def gpu_cards():
     return cards
 
 
+def nvidia_model(full):
+    """"NVIDIA GeForce RTX 3090" -> "RTX 3090"."""
+    words = [w for w in full.split() if w not in ("NVIDIA", "GeForce")]
+    return " ".join(words) or full
+
+
+def amd_model(full):
+    """"Strix [Radeon 880M / 890M]" -> "Radeon 880M": the first name inside the brackets."""
+    inner = full[full.find("[") + 1:full.rfind("]")] if "[" in full else full
+    return inner.split("/")[0].strip() or full
+
+
 def _nvidia_cards():
     """{name: {"uuid", "mib"}} in nvidia-smi order, named by model number ("RTX 3090" -> "3090").
     The last good answer is cached, so a hiccup in nvidia-smi doesn't rename the lines.
@@ -426,7 +518,7 @@ def _nvidia_cards():
             name = next((t for t in reversed(model.split()) if any(c.isdigit() for c in t)), model)
             if name in cards:
                 name += "-%d" % len(cards)
-            cards[name] = {"uuid": uuid, "mib": int(float(mib))}
+            cards[name] = {"uuid": uuid, "mib": int(float(mib)), "model": nvidia_model(model)}
         if cards:
             STATE.mkdir(parents=True, exist_ok=True)
             cache.write_text(json.dumps(cards))
@@ -709,7 +801,8 @@ def amd_cards():
         name = _amd_short_name(_pci_name(dev), dev)
         while name in out:
             name += "-%d" % len(out)
-        out[name] = {"vendor": "amd", "uuid": uid and "GPU-" + uid.zfill(16) or pci or c.name,
+        out[name] = {"vendor": "amd", "model": amd_model(_pci_name(dev)),
+                     "uuid": uid and "GPU-" + uid.zfill(16) or pci or c.name,
                      "mib": (gtt if integrated else vram) // (1 << 20), "integrated": integrated,
                      "env_var": "ROCR_VISIBLE_DEVICES", "env_value": env_value, "pci": pci}
     return out
@@ -878,6 +971,35 @@ def _place_residents(use, residents):
         u["jobs"] = keep
 
 
+def card_meters(cards):
+    """{card: {"used_mib", "util"}}: memory in use and utilisation percent per card, for the TUI's
+    summary bars. nvidia-smi for NVIDIA; sysfs for AMD (an iGPU's memory is its GTT use).
+    Either value may be None. Empty under GPUQ_CARDS (the tests' fake cards)."""
+    out = {}
+    if os.environ.get("GPUQ_CARDS"):
+        return out
+    by_uuid = {c["uuid"]: n for n, c in cards.items() if c.get("vendor") != "amd" and c.get("uuid")}
+    if by_uuid:
+        try:
+            r = subprocess.run(["nvidia-smi", "--query-gpu=uuid,memory.used,utilization.gpu",
+                                "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10)
+            for line in r.stdout.splitlines() if r.returncode == 0 else []:
+                uuid, used, util = [x.strip() for x in line.split(",")]
+                if uuid in by_uuid:
+                    out[by_uuid[uuid]] = {"used_mib": int(used) if used.isdigit() else None,
+                                          "util": int(util) if util.isdigit() else None}
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+    for n, c in cards.items():
+        if c.get("vendor") == "amd":
+            d = SYSFS / "class" / "drm" / _card_dir(c) / "device"
+            used = _read(d / ("mem_info_gtt_used" if c.get("integrated") else "mem_info_vram_used"))
+            util = _read(d / "gpu_busy_percent")
+            out[n] = {"used_mib": int(used) >> 20 if used.isdigit() else None,
+                      "util": int(util) if util.isdigit() else None}
+    return out
+
+
 def local_snapshot(now):
     with store(write=False) as Q:
         lines, cards = Q["lines"], Q["cards"]
@@ -889,6 +1011,7 @@ def local_snapshot(now):
             loaded = [j for u in use.values() for j in u["jobs"]]
         snap = snapshot(lines[Q["default"]], now, history(), loaded, paused=paused_state(),
                         lines=lines, cards=cards, card_use=use, default=Q["default"], evac=read_evac())
+        snap["meters"] = card_meters(cards)
         if use and len(use) == 1:       # one card: per_card() leaves the snapshot alone, so carry busy here
             snap["busy"] = next(iter(use.values())).get("busy")
         return snap
@@ -963,20 +1086,24 @@ def _tui(args):
     def loop(scr):
         curses.curs_set(0)
         curses.use_default_colors()
+        # colour has meaning: green = running, yellow = yielding, red = needs a human,
+        # dim = detail; machines get their own colours from a palette that avoids those three
         curses.init_pair(1, curses.COLOR_GREEN, -1)
         curses.init_pair(2, curses.COLOR_YELLOW, -1)
-        style = {"head": curses.A_REVERSE | curses.A_BOLD, "run": curses.color_pair(1) | curses.A_BOLD,
-                 "sel": curses.A_REVERSE, "warn": curses.color_pair(2) | curses.A_BOLD,
-                 "dim": curses.A_DIM, "dimhead": curses.A_REVERSE | curses.A_DIM,
+        curses.init_pair(3, curses.COLOR_RED, -1)
+        style = {"title": curses.A_REVERSE | curses.A_BOLD, "head": curses.A_REVERSE | curses.A_BOLD,
+                 "run": curses.color_pair(1) | curses.A_BOLD, "sel": curses.A_REVERSE | curses.A_BOLD,
+                 "warn": curses.color_pair(2) | curses.A_BOLD, "alert": curses.color_pair(3) | curses.A_BOLD,
+                 "wait": curses.A_NORMAL, "dim": curses.A_DIM, "dimhead": curses.A_REVERSE | curses.A_DIM,
                  "": curses.A_NORMAL}
-        pal = [curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_YELLOW,
-               curses.COLOR_GREEN, curses.COLOR_BLUE, curses.COLOR_RED]
+        pal = [curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_BLUE,
+               curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_BLUE]
         for i, c in enumerate(pal):
             curses.init_pair(11 + i, c, -1)
 
         def resolve(st):
             """A fixed style name, or a GPU-coloured header key 'h<idx>' (+ 's' when focused)."""
-            if len(st) >= 2 and st[0] == "h" and st[1].isdigit():
+            if len(st) >= 2 and st[0] in "hm" and st[1].isdigit():
                 a = curses.color_pair(11 + int(st[1])) | curses.A_BOLD
                 return a | curses.A_REVERSE if st.endswith("s") else a
             return style.get(st, curses.A_NORMAL)

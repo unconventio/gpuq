@@ -281,7 +281,7 @@ class Pause(unittest.TestCase):
         g.COMPAT_LOCK = ""
         snap = g.snapshot(queue("a"), T0, [], None, host="hostB", paused={"since": T0})
         self.assertIn("PAUSED", g.render(snap))
-        self.assertIn("PAUSED", g.tui_lines([("hostB", snap, None)], 0, 0, T0)[0][0])
+        self.assertIn("PAUSED", "\n".join(t for t, _ in g.tui_lines([("hostB", snap, None)], 0, 0, T0)))
 
 
 class View(unittest.TestCase):
@@ -667,7 +667,7 @@ class Residents(unittest.TestCase):
         self.assertIn("residents: whisper-server", out)
         self.assertIn("unqueued GPU use", out)          # the 3060's ollama, nothing queued there
         tui = g.tui_lines([("hostB", v, None) for v in views], 1, 0, T0)
-        self.assertTrue(any("hostB 3060" in t for t, _ in tui))
+        self.assertTrue(any("hostB · 3060" in t for t, _ in tui))
 
 
 if __name__ == "__main__":
