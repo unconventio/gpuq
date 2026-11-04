@@ -9,7 +9,7 @@ GPU users:  ID=$(gpuq join --owner NAME --job TEXT --why TEXT --models a,b --est
             Yield: moving the running job down (a human, or `gpuq yield ID`) makes its next beat exit 5.
             Nobody may start until it acknowledges — by calling start (exit 3, it is waiting again)
             or done. When it is #1 again, its own start loop resumes it: no "I'm done" message needed.
-Humans:     gpuq                          show the line once
+Humans:     gpuq                          the live view (TUI) at a terminal; piped, prints the line once
             gpuq tui --hosts a,b          interactive: ↑↓ select, k/j (or Shift-↑↓) move up/down, d remove
             gpuq watch --hosts a,b        plain live view of several machines
             gpuq mv 3 1  ·  gpuq rm 4     reorder / remove (by position or id); moving the running
@@ -1445,7 +1445,14 @@ def state_name(cmd, code):
 
 
 def _run(args, now):
-    cmd = args.cmd or "show"
+    cmd = args.cmd
+    if cmd is None:
+        # bare `gpuq` at a terminal opens the TUI, like htop; piped or scripted, it prints the queue
+        if sys.stdin.isatty() and sys.stdout.isatty() and not args.host:
+            args.hosts = config().get("hosts") or HOST
+            args.every = 5
+            return _tui(args)
+        cmd = "show"
     if cmd == "show":
         if getattr(args, "json", False):
             print(json.dumps(local_snapshot(now)))    # machine-readable: always local, never recurses

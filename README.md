@@ -31,8 +31,8 @@ State lives in `~/.local/state/gpuq` (override: `$GPUQ_STATE`). Run `gpuq sweep`
     gpuq where --vram 16                 # which card, on which machine, how soon
     ID=$(gpuq join --owner nightly --job "eval sweep" --vram 16 --est 90 --max 180)
     gpuq run $ID -- python eval.py       # waits its turn, runs, heartbeats, releases
-    gpuq                                 # look at the line
-    gpuq tui                             # interactive: move jobs with k/j, d removes, p pauses
+    gpuq                                 # live view (like htop): k/j move jobs, Tab switches GPU, q quits
+    gpuq show                            # print the line once (what `gpuq` prints when piped)
     gpuq inventory                       # what every card offers
 
 ## The agent protocol
