@@ -535,31 +535,31 @@ def frees_at(snap, now):
 
 
 def fleet_alerts(views, now):
-    """[(text)] — everything that needs a human, on every GPU: warnings, jobs past their
-    estimate, pauses, unreachable machines. One line each, named by GPU."""
+    """[(view index, text)] — everything that needs a human, on every GPU: warnings, jobs past
+    their estimate, held lines, unreachable machines. One line each, named by GPU."""
     out, paused = [], set()
-    for host, snap, err in views:
+    for vi, (host, snap, err) in enumerate(views):
         if err or snap is None:
-            out.append("%s unreachable" % host)
+            out.append((vi, "%s unreachable" % host))
             continue
         card, c = _card_of(snap)
         name = c.get("model") or card or host
         if snap.get("paused") and host not in paused:
             paused.add(host)
-            out.append("%s: queue paused — nobody may start" % host)
+            out.append((vi, "%s: line held — nobody may start" % host))
         r = _runner(snap["entries"])
         if r and r["state"] == "running" and r.get("est_min") and r.get("started") is not None:
             over = now - r["started"] - r["est_min"] * 60
             if over > 0:
-                out.append("%s: %s is %s past its estimate (beat %s ago)" % (
-                    name, r["owner"], fmt_dur(over), fmt_dur(now - (r["heartbeat"] or r["started"]))))
+                out.append((vi, "%s: %s is %s past its estimate (beat %s ago)" % (
+                    name, r["owner"], fmt_dur(over), fmt_dur(now - (r["heartbeat"] or r["started"])))))
         for w in warnings(snap):
             if w.startswith("⚠"):
-                out.append("%s: %s" % (name, w.lstrip("⚠ ")))
+                out.append((vi, "%s: %s" % (name, w.lstrip("⚠ "))))
     return out
 
 
-def screen_summary(views, hosts, now, width, focus):
+def screen_summary(views, hosts, now, width, focus, flagged=()):
     """The status table: one row per GPU. Columns fit WIDTH by stepping down (bars, then
     numbers; the model column only when there's room; NOW takes what is left)."""
     rows = []
@@ -618,8 +618,11 @@ def screen_summary(views, hosts, now, width, focus):
         if total <= width - 1 and widths[heads.index("NOW")] >= want:
             break
     out = [(fmt(heads).rstrip(), "dim")]
-    for r, f in zip(table, rows):
-        out.append((fmt(r).rstrip()[:max(width - 1, 0)], "%s|b2:%d" % (f["st"], 2 + len(f["name"]))))
+    for vi, (r, f) in enumerate(zip(table, rows)):
+        line = fmt(r).rstrip()
+        if vi in flagged:               # ⚠ in the margin: this GPU has an alert below
+            line = "⚠" + line[1:]
+        out.append((line[:max(width - 1, 0)], "%s|b2:%d" % (f["st"], 2 + len(f["name"]))))
     return out
 
 
@@ -644,8 +647,8 @@ def tui_screen(views, sel_host, sel_row, now, width=80):
                                           " · ⚠ %d need%s you" % (len(alerts), "s" * (len(alerts) == 1))
                                           if alerts else "")
     L = [(_rule(title, width), "title")]
-    L.extend(screen_summary(views, hosts, now, width, sel_host))
-    L.extend(("  ⚠ " + _trim(a, width - 6), "alert") for a in alerts)
+    L.extend(screen_summary(views, hosts, now, width, sel_host, {vi for vi, _ in alerts}))
+    L.extend(("  ⚠ " + _trim(a, width - 6), "alert") for _, a in alerts)
     if not (0 <= sel_host < len(views)):
         return L
     host, snap, err = views[sel_host]
@@ -1312,9 +1315,37 @@ def fetch_views(hosts):
     return views
 
 
-TUI_KEYS = " ↑↓ job  ←→ GPU  k/j move  d remove  p pause  ? help  q quit "
-TUI_HELP = (" ↑↓ select a job · k/Shift-↑ move it up (sooner) · j/Shift-↓ down (later) · d remove ·"
-            " p pause/resume the machine · Tab/←→ switch GPU · r refresh · q quit ")
+TUI_KEYS = " ↑↓ job  ←→ GPU  k/j move  d remove  p hold  ? help  q quit "
+TUI_HELP = """GPU Queue — help                                         any key closes
+
+KEYS
+  ↑ ↓          select a job in the GPU's line below
+  ← → / Tab    switch GPU (the summary row in full brightness is the one shown)
+  k / Shift-↑  move the selected job up, sooner;  j / Shift-↓  down, later.
+               Moving the running job down asks it to yield: it stops at its next
+               heartbeat, waits, and resumes when it is #1 again.
+  d            remove the selected job from the line (its process is not killed)
+  p            hold / release the machine's line: while held nobody may start,
+               on any of that machine's GPUs. Running jobs keep running.
+  r            refresh now (it refreshes every few seconds anyway)
+  q / Esc      quit; jobs are not affected
+
+SUMMARY
+  NOW          who holds the card and what they run; idle, or free with jobs waiting
+  FREES        when the card frees up: a time, now, soon (yielding), over (past its
+               estimate, end unknown), ? (no estimate)
+  NEXT         how many jobs wait behind it
+  MEM / UTIL   memory in use / total (sh = an iGPU's shared system memory) and load
+  ⚠            something needs you, on any GPU: a job past its estimate, one that
+               won't yield, GPU use outside the queue, a held line, a lost machine
+
+MARKS
+  ▶ running   ⏏ yielding   ⚑ ablaze (30)   ★ important (20)   ☾ chill (5)
+  blank = normal (10). Higher priority goes first; outranking the running job
+  makes it yield. Short jobs may pass normal and chill jobs, never important ones.
+
+COLORS
+  green running · yellow yielding · red needs you · dim detail""".splitlines()
 
 
 # Shift-↑/↓ as raw escape sequences, for terminals whose terminfo doesn't decode them
@@ -1350,11 +1381,10 @@ def _tui(args):
         def resolve(st):
             """A fixed style name, or a GPU-colored header key 'h<idx>' (+ 's' when focused)."""
             if len(st) >= 2 and st[0] in "hm" and st[1].isdigit():
-                # machine color; in the summary the focused GPU (the tab) is in color, the rest dim
-                a = curses.color_pair(11 + int(st[1]))
+                # no per-machine colors: the shown GPU's summary row is plain, the others dim
                 if st[0] == "m" and not st.endswith("s"):
                     return curses.A_DIM
-                return a
+                return curses.A_NORMAL
             return style.get(st, curses.A_NORMAL)
         scr.timeout(250)
         views, fetched, sh, sr, msg = fetch_views(hosts), time.time(), 0, 0, ""
@@ -1422,13 +1452,20 @@ def _tui(args):
                 step = -1 if k in (curses.KEY_BTAB, curses.KEY_LEFT) else 1
                 sh, sr = (sh + step) % len(views), 0
             elif k == ord("?"):
-                msg = TUI_HELP
+                scr.erase()
+                for y, text in enumerate(TUI_HELP[:h]):
+                    put(y, " " + text, curses.A_BOLD if y == 0 or text.isupper() else curses.A_NORMAL)
+                scr.refresh()
+                scr.timeout(-1)
+                scr.getch()
+                scr.timeout(250)
             elif k == ord("r"):
                 fetched = 0
             elif k == ord("p") and views[sh][1]:
                 verb = "resume" if views[sh][1].get("paused") else "pause"
                 code, out = act(host, verb)
-                msg = " " + (out or "%s: queue %sd" % (host, verb)) + " "
+                msg = " " + (out or "%s: line %s" % (host, "held — nobody may start" if verb == "pause"
+                                                       else "released")) + " "
                 fetched = 0
             elif shift_dir(k) and q:
                 pos = sr + 1 + shift_dir(k)
