@@ -428,3 +428,32 @@ class TuiTabs(unittest.TestCase):
         rows = [(t, st) for t, st in g.tui_lines(views, 1, 0, 0, 100, only_focus=True) if st.startswith("m")]
         self.assertTrue(rows[1][1].partition("|")[0].endswith("s"))
         self.assertFalse(rows[0][1].partition("|")[0].endswith("s"))
+
+
+class Screen(unittest.TestCase):
+    def views(self):
+        from gpuq import core
+        out = []
+        for h, est in (("a", 60), ("b", 1)):
+            q = []
+            core.join(q, 0, "own-" + h, "job-" + h, est_min=est)
+            core.start(q, 0, q[0]["id"])
+            core.join(q, 0, "next-" + h, "later-" + h, est_min=30)
+            out.append((h, {"host": h, "entries": q, "now": 7200, "history": [],
+                            "cards": {"G" + h: {"mib": 8192, "model": "Card " + h}}}, None))
+        return out
+
+    def test_status_alerts_and_blocked(self):
+        from gpuq import cli as g
+        L = g.tui_screen(self.views(), 0, 1, 7200, 100)
+        text = "\n".join(t for t, _ in L)
+        self.assertIn("2 need you", L[0][0])
+        self.assertIn("Card b: own-b is 1h59 past its estimate", text)   # alert for the other GPU
+        self.assertIn("over", text)
+        self.assertIn("blocked: 1 ahead · own-a has the card", text)
+        self.assertNotIn("later-b", text)                                 # only the focused line
+        self.assertTrue(all(len(t) < 100 for t, _ in L))
+
+    def test_fits_80_columns(self):
+        from gpuq import cli as g
+        self.assertTrue(all(len(t) < 80 for t, _ in g.tui_screen(self.views(), 1, 0, 7200, 80)))

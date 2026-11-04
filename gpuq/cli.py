@@ -507,6 +507,199 @@ def tui_lines(views, sel_host, sel_row, now, width=80, only_focus=False):
         L.extend((fmt_event(h, now), "dim") for h in hist[-4:])
     return L
 
+# ---- the TUI screen: status first (every GPU, every alert), then one GPU's line ----
+
+def _card_of(snap):
+    cards = snap.get("cards") or {}
+    card = snap.get("card") or (next(iter(cards)) if len(cards) == 1 else None)
+    return card, cards.get(card) or {}
+
+
+def _runner(q):
+    return q[0] if q and q[0]["state"] in ("running", "yielding") else None
+
+
+def frees_at(snap, now):
+    """When the card frees up, for the summary: "now", "~20:07", "soon" (yielding), "over"
+    (past its estimate), or "?" (no estimate)."""
+    q = snap["entries"]
+    r = _runner(q)
+    if r is None:
+        return "now"
+    if r["state"] == "yielding":
+        return "soon"
+    if not r.get("est_min") or r.get("started") is None:
+        return "?"
+    end = r["started"] + r["est_min"] * 60
+    return "~" + fmt_clock(end, now) if end > now else "over"
+
+
+def fleet_alerts(views, now):
+    """[(text)] — everything that needs a human, on every GPU: warnings, jobs past their
+    estimate, pauses, unreachable machines. One line each, named by GPU."""
+    out, paused = [], set()
+    for host, snap, err in views:
+        if err or snap is None:
+            out.append("%s unreachable" % host)
+            continue
+        card, c = _card_of(snap)
+        name = c.get("model") or card or host
+        if snap.get("paused") and host not in paused:
+            paused.add(host)
+            out.append("%s: queue paused — nobody may start" % host)
+        r = _runner(snap["entries"])
+        if r and r["state"] == "running" and r.get("est_min") and r.get("started") is not None:
+            over = now - r["started"] - r["est_min"] * 60
+            if over > 0:
+                out.append("%s: %s is %s past its estimate (beat %s ago)" % (
+                    name, r["owner"], fmt_dur(over), fmt_dur(now - (r["heartbeat"] or r["started"]))))
+        for w in warnings(snap):
+            if w.startswith("⚠"):
+                out.append("%s: %s" % (name, w.lstrip("⚠ ")))
+    return out
+
+
+def screen_summary(views, hosts, now, width, focus):
+    """The status table: one row per GPU. Columns fit WIDTH by stepping down (bars, then
+    numbers; the model column only when there's room; NOW takes what is left)."""
+    many = len(hosts) > 1
+    rows = []
+    for hi, (host, snap, err) in enumerate(views):
+        idx = hosts.index(host) % 6
+        st = "m%d%s" % (idx, "s" if hi == focus else "")
+        if err or snap is None:
+            rows.append(dict(name="?", host=host, now="unreachable", frees="", next="", used=None,
+                             gib=None, shared=False, util=None, model="", st=st))
+            continue
+        card, c = _card_of(snap)
+        m = (snap.get("meters") or {}).get(card) or {}
+        q = snap["entries"]
+        r = _runner(q)
+        waiting = len(q) - (1 if r else 0)
+        rows.append(dict(
+            name=c.get("model") or card or host, host=host,
+            now=("%s %s  %s" % ("▶" if r["state"] == "running" else "⏏", r["owner"], r["job"]) if r
+                 else "idle" if not q else "free, %d waiting" % waiting),
+            frees=frees_at(snap, now), next="+%d" % waiting if r and waiting else "-",
+            used=m.get("used_mib"), gib=c.get("mib"), shared=bool(c.get("integrated")),
+            util=m.get("util"), model=",".join(r["models"]) if r else "", st=st))
+
+    def mem(f, bars):
+        tot = ("%d%s" % (round(f["gib"] / 1024), "G sh" if f["shared"] else "G")) if f["gib"] else "?"
+        txt = "%s/%s" % ("%.0f" % (f["used"] / 1024) if f["used"] is not None else "?", tot)
+        frac = f["used"] / f["gib"] if f["used"] is not None and f["gib"] else None
+        return "%s %s" % (_bar(frac, bars), txt) if bars else txt
+
+    def util(f, bars):
+        pct = "%3d%%" % f["util"] if f["util"] is not None else "  ?"
+        return "%s %s" % (_bar(f["util"] / 100 if f["util"] is not None else None, bars), pct) if bars else pct
+
+    def build(bars, show_model):
+        heads = ["GPU"] + (["HOST"] if many else []) + ["NOW", "FREES", "NEXT", "MEM", "UTIL"] + \
+            (["MODEL"] if show_model else [])
+        table = [[f["name"]] + ([f["host"]] if many else []) + [f["now"], f["frees"], f["next"],
+                 mem(f, bars), util(f, bars)] + ([f["model"]] if show_model else []) for f in rows]
+        ni = heads.index("NOW")
+        widths = [max([len(r[i]) for r in table] + [len(heads[i])]) for i in range(len(heads))]
+        fixed = sum(w for i, w in enumerate(widths) if i != ni) + 2 * (len(heads) - 1) + 2
+        widths[ni] = max(10, min(widths[ni], width - 1 - fixed))
+        fmt = lambda r: "  " + "  ".join(_trim(x, widths[i]).ljust(widths[i]) for i, x in enumerate(r))
+        return fixed + widths[ni], heads, table, fmt, widths
+
+    # (bar cells, model column, the least room NOW may get): roomiest first
+    for bars, show_model, now_min in ((10, True, 36), (10, False, 28), (5, False, 24), (0, False, 0)):
+        total, heads, table, fmt, widths = build(bars, show_model)
+        want = min(now_min, max(len(r[heads.index("NOW")]) for r in table))
+        if total <= width - 1 and widths[heads.index("NOW")] >= want:
+            break
+    out = [(fmt(heads).rstrip(), "dim")]
+    for r, f in zip(table, rows):
+        out.append((fmt(r).rstrip()[:max(width - 1, 0)], "%s|b2:%d" % (f["st"], 2 + len(f["name"]))))
+    return out
+
+
+def _blocked(snap, q, i, now):
+    """Why a waiting job isn't running yet, in one plain line."""
+    if snap.get("paused"):
+        return "blocked: the queue is paused"
+    y = yielding(q)
+    if y:
+        return "blocked: %s (%s) is still stopping to yield" % (y[0]["owner"], y[0]["id"])
+    if i == 0:
+        return "next: it starts as soon as it calls `gpuq start` (within 15 min, or it is skipped)"
+    return "blocked: %d ahead · %s has the card, frees %s" % (i, q[0]["owner"], frees_at(snap, now))
+
+
+def tui_screen(views, sel_host, sel_row, now, width=80):
+    """[(text, style)] for the TUI: a title bar, the status table for every GPU, alerts for every
+    GPU, then the focused GPU's line (two rows per job) with a detail block for the selected job."""
+    hosts = list(dict.fromkeys(v[0] for v in views))
+    alerts = fleet_alerts(views, now)
+    title = " GPU Queue · %d GPU%s%s " % (len(views), "s" * (len(views) != 1),
+                                          " · ⚠ %d need%s you" % (len(alerts), "s" * (len(alerts) == 1))
+                                          if alerts else "")
+    side = max(2, (width - 1 - len(title)) // 2)
+    L = [(("─" * side + title + "─" * side)[:max(width - 1, 0)], "title")]
+    L.extend(screen_summary(views, hosts, now, width, sel_host))
+    L.extend(("  ⚠ " + _trim(a, width - 6), "alert") for a in alerts)
+    if not (0 <= sel_host < len(views)):
+        return L
+    host, snap, err = views[sel_host]
+    idx = hosts.index(host) % 6
+    if err or snap is None:
+        L.append((_rule(" %s " % host, width), "h%d" % idx))
+        L.append(("  " + (err or "no data"), "alert"))
+        return L
+    card, c = _card_of(snap)
+    name = c.get("model") or card or host
+    label = " %s · %s " % (name, host)
+    rule = _rule(label, width)
+    at = rule.find(name)
+    L.append((rule, "h%d|b%d:%d" % (idx, at, at + len(name))))
+    q = snap["entries"]
+    if not q:
+        L.append(("  queue empty: free now", "dim"))
+    sel = None
+    for i, (e, timing) in enumerate(entry_timings(q, now)):
+        run, yld = e["state"] == "running", e["state"] == "yielding"
+        line = "  %d %s%s %-12s  %s" % (i + 1, "▶" if run else "⏏" if yld else " ", prio_mark(e),
+                                        e["owner"][:12], e["job"])
+        is_sel = i == sel_row
+        if is_sel:
+            sel = (i, e)
+        L.append((_trim(line, width - 1), "sel" if is_sel else "run" if run else "warn" if yld else "wait"))
+        bits = [timing]
+        if run or yld:
+            bits.append("beat %s ago" % fmt_dur(now - (e["heartbeat"] or e["started"])))
+        if e["models"]:
+            bits.append(",".join(e["models"]))
+        if e.get("progress"):
+            bits.append(e["progress"])
+        L.append((_trim("          " + " · ".join(bits), width - 1), "dim"))
+    if sel:
+        i, e = sel
+        bits = ["#%d %s" % (i + 1, e["id"]), "priority %d" % prio(e), "joined %s" % fmt_clock(e["joined"], now)]
+        if e.get("max_min"):
+            bits.append("max %s" % fmt_dur(e["max_min"] * 60))
+        L.append(("", ""))
+        L.append((_trim(" ┄ " + " · ".join(bits), width - 1), "dim"))
+        if e["state"] == "waiting":
+            L.append((_trim("   " + _blocked(snap, q, i, now), width - 1), "warn"))
+        if e.get("why"):
+            L.append((_trim("   why: " + e["why"], width - 1), "dim"))
+    info = [w for w in warnings(snap) if not w.startswith("⚠")]
+    for w in info:
+        L.append((_trim("   " + w, width - 1), "dim"))
+    hist = snap.get("history") or []
+    if hist:
+        L.append((_trim(" recent: " + " · ".join(fmt_event(x, now) for x in hist[-2:][::-1]), width - 1), "dim"))
+    return L
+
+
+def _rule(label, width):
+    side = max(2, (width - 1 - len(label)) // 2)
+    return ("─" * side + label + "─" * side)[:max(width - 1, 0)]
+
 
 # ---- I/O: state files, history, compat lock, GPU usage ----
 
@@ -1113,7 +1306,9 @@ def fetch_views(hosts):
     return views
 
 
-TUI_KEYS = " ↑↓ select · k/Shift-↑ move up (sooner) · j/Shift-↓ move down (later) · d remove · p pause/resume · Tab/←→ GPU · r refresh · q quit "
+TUI_KEYS = " ↑↓ job  ←→ GPU  k/j move  d remove  p pause  ? help  q quit "
+TUI_HELP = (" ↑↓ select a job · k/Shift-↑ move it up (sooner) · j/Shift-↓ down (later) · d remove ·"
+            " p pause/resume the machine · Tab/←→ switch GPU · r refresh · q quit ")
 
 
 # Shift-↑/↓ as raw escape sequences, for terminals whose terminfo doesn't decode them
@@ -1191,7 +1386,7 @@ def _tui(args):
             sr = max(0, min(sr, len(entries()) - 1))
             h, w = scr.getmaxyx()
             scr.erase()
-            for y, (text, st) in enumerate(tui_lines(views, sh, sr, time.time(), w, only_focus=True)[:h - 1]):
+            for y, (text, st) in enumerate(tui_screen(views, sh, sr, time.time(), w)[:h - 1]):
                 st, _, span = st.partition("|")
                 bold = tuple(int(x) for x in span[1:].split(":")) if span.startswith("b") else None
                 put(y, text, resolve(st), bold)
@@ -1220,6 +1415,8 @@ def _tui(args):
             elif k in (9, curses.KEY_RIGHT, curses.KEY_BTAB, curses.KEY_LEFT):
                 step = -1 if k in (curses.KEY_BTAB, curses.KEY_LEFT) else 1
                 sh, sr = (sh + step) % len(views), 0
+            elif k == ord("?"):
+                msg = TUI_HELP
             elif k == ord("r"):
                 fetched = 0
             elif k == ord("p") and views[sh][1]:
