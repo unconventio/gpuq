@@ -381,7 +381,8 @@ def summary_lines(views, hosts, width=120):
         else:
             what = "idle" if not q else "%d waiting" % len(q)
         facts.append(dict(name=c.get("model") or card or host,
-                          size="%d GB%s" % (round(gib / 1024), " shared" if c.get("integrated") else "")
+                          # an iGPU borrows system RAM: up to that much, so "≤24 GB"
+                          size="%s%d GB" % ("≤" if c.get("integrated") else "", round(gib / 1024))
                           if gib else "", host=host, used=m.get("used_mib"), gib=gib, util=m.get("util"),
                           what=what, st="m%d" % idx))
 
