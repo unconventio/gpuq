@@ -562,7 +562,6 @@ def fleet_alerts(views, now):
 def screen_summary(views, hosts, now, width, focus):
     """The status table: one row per GPU. Columns fit WIDTH by stepping down (bars, then
     numbers; the model column only when there's room; NOW takes what is left)."""
-    many = len(hosts) > 1
     rows = []
     for hi, (host, snap, err) in enumerate(views):
         idx = hosts.index(host) % 6
@@ -578,11 +577,16 @@ def screen_summary(views, hosts, now, width, focus):
         waiting = len(q) - (1 if r else 0)
         rows.append(dict(
             name=c.get("model") or card or host, host=host,
-            now=("%s %s  %s" % ("▶" if r["state"] == "running" else "⏏", r["owner"], r["job"]) if r
+            now=("%s%s  %s" % (r["owner"], " (yielding)" if r["state"] == "yielding" else "", r["job"]) if r
                  else "idle" if not q else "free, %d waiting" % waiting),
             frees=frees_at(snap, now), next="+%d" % waiting if r and waiting else "-",
             used=m.get("used_mib"), gib=c.get("mib"), shared=bool(c.get("integrated")),
             util=m.get("util"), model=",".join(r["models"]) if r else "", st=st))
+    # the same GPU model on two machines: name the machine too
+    names = [f["name"] for f in rows]
+    for f in rows:
+        if names.count(f["name"]) > 1:
+            f["name"] += " @" + f["host"]
 
     def mem(f, bars):
         tot = ("%d%s" % (round(f["gib"] / 1024), "G sh" if f["shared"] else "G")) if f["gib"] else "?"
@@ -595,10 +599,9 @@ def screen_summary(views, hosts, now, width, focus):
         return "%s %s" % (_bar(f["util"] / 100 if f["util"] is not None else None, bars), pct) if bars else pct
 
     def build(bars, show_model):
-        heads = ["GPU"] + (["HOST"] if many else []) + ["NOW", "FREES", "NEXT", "MEM", "UTIL"] + \
-            (["MODEL"] if show_model else [])
-        table = [[f["name"]] + ([f["host"]] if many else []) + [f["now"], f["frees"], f["next"],
-                 mem(f, bars), util(f, bars)] + ([f["model"]] if show_model else []) for f in rows]
+        heads = ["GPU", "NOW", "FREES", "NEXT", "MEM", "UTIL"] + (["MODEL"] if show_model else [])
+        table = [[f["name"], f["now"], f["frees"], f["next"], mem(f, bars), util(f, bars)] +
+                 ([f["model"]] if show_model else []) for f in rows]
         ni = heads.index("NOW")
         widths = [max([len(r[i]) for r in table] + [len(heads[i])]) for i in range(len(heads))]
         fixed = sum(w for i, w in enumerate(widths) if i != ni) + 2 * (len(heads) - 1) + 2
@@ -638,8 +641,7 @@ def tui_screen(views, sel_host, sel_row, now, width=80):
     title = " GPU Queue · %d GPU%s%s " % (len(views), "s" * (len(views) != 1),
                                           " · ⚠ %d need%s you" % (len(alerts), "s" * (len(alerts) == 1))
                                           if alerts else "")
-    side = max(2, (width - 1 - len(title)) // 2)
-    L = [(("─" * side + title + "─" * side)[:max(width - 1, 0)], "title")]
+    L = [(_rule(title, width), "title")]
     L.extend(screen_summary(views, hosts, now, width, sel_host))
     L.extend(("  ⚠ " + _trim(a, width - 6), "alert") for a in alerts)
     if not (0 <= sel_host < len(views)):
@@ -696,9 +698,11 @@ def tui_screen(views, sel_host, sel_row, now, width=80):
     return L
 
 
+RULE_INDENT = 12   # rule labels start here and stay put; the line runs on to the edge
+
+
 def _rule(label, width):
-    side = max(2, (width - 1 - len(label)) // 2)
-    return ("─" * side + label + "─" * side)[:max(width - 1, 0)]
+    return ("─" * RULE_INDENT + label + "─" * max(width, 0))[:max(width - 1, 0)]
 
 
 # ---- I/O: state files, history, compat lock, GPU usage ----
