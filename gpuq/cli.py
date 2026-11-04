@@ -617,7 +617,7 @@ def screen_summary(views, hosts, now, width, focus, flagged=()):
         want = min(now_min, max(len(r[heads.index("NOW")]) for r in table))
         if total <= width - 1 and widths[heads.index("NOW")] >= want:
             break
-    out = [(fmt(heads).rstrip(), "dim")]
+    out = [(fmt(heads).rstrip(), "colhead")]
     col = {hd: 2 + sum(widths[:i]) + 2 * i for i, hd in enumerate(heads)}
     for vi, (r, f) in enumerate(zip(table, rows)):
         line = fmt(r).rstrip()
@@ -629,6 +629,12 @@ def screen_summary(views, hosts, now, width, focus, flagged=()):
             spans.append("r0:1")
         if f["st"].endswith("s"):
             spans.append("b2:%d" % (2 + len(f["name"])))
+        if bars:                        # the filled part of each bar in the accent color
+            for hd, frac in (("MEM", f["used"] / f["gib"] if f["used"] is not None and f["gib"] else None),
+                             ("UTIL", f["util"] / 100 if f["util"] is not None else None)):
+                k = 0 if frac is None else max(0, min(bars, round(frac * bars)))
+                if k:
+                    spans.append("a%d:%d" % (col[hd], col[hd] + k))
         fr = col["FREES"]
         if f["frees"] == "now":
             spans.append("g%d:%d" % (fr, fr + 3))
@@ -676,7 +682,7 @@ def tui_screen(views, sel_host, sel_row, now, width=80):
     label = " %s · %s " % (name, host)
     rule = _rule(label, width)
     at = rule.find(name)
-    L.append((rule, "h%d|b%d:%d" % (idx, at, at + len(name))))
+    L.append((rule, "rule|b%d:%d" % (at, at + len(name))))
     q = snap["entries"]
     if not q:
         L.append(("  queue empty: free now", "dim"))
@@ -1367,8 +1373,9 @@ COLORS  (always next to a word or symbol that says the same)
   yellow     temporary, watch it: yielding, over its estimate, memory nearly full
   green now  free now: a job could start on that GPU
   bold name  the GPU whose line is shown below
+  cyan       the frame: title, rules, column names, bars (no meaning of its own)
   dim        detail""".splitlines()
-HELP_COLORS = [("red ⚠", "r"), ("yellow", "y"), ("green now", "g"), ("bold name", "b"), ("⚠", "r"),
+HELP_COLORS = [("cyan", "a"), ("red ⚠", "r"), ("yellow", "y"), ("green now", "g"), ("bold name", "b"), ("⚠", "r"),
                ("⚑", "b"), ("over", "y"), ("soon", "y"), ("⏏", "y")]
 
 
@@ -1397,9 +1404,16 @@ def _tui(args):
         green = curses.color_pair(1) if colors else curses.A_BOLD
         yellow = (curses.color_pair(2) if colors else 0) | curses.A_BOLD
         red = (curses.color_pair(3) if colors else 0) | curses.A_BOLD
-        span_attr = {"b": curses.A_BOLD, "g": green, "y": yellow, "r": red}
+        # one accent color for the frame (title, rules, column names, bars): structure, not meaning
+        if colors:
+            curses.init_pair(4, curses.COLOR_CYAN, -1)
+            curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        accent = curses.color_pair(4) if colors else curses.A_NORMAL
+        span_attr = {"b": curses.A_BOLD, "g": green, "y": yellow, "r": red, "a": accent}
         # bold: the title and the focused GPU's name; reverse: the title, the selected job, the key bar
-        style = {"title": curses.A_BOLD | curses.A_REVERSE, "head": curses.A_UNDERLINE,
+        style = {"title": (curses.color_pair(5) if colors else curses.A_REVERSE) | curses.A_BOLD,
+                 "rule": accent, "colhead": accent | curses.A_DIM if not colors else accent,
+                 "head": curses.A_UNDERLINE,
                  "run": curses.A_NORMAL, "sel": curses.A_REVERSE,
                  "warn": yellow, "alert": red,
                  "wait": curses.A_NORMAL, "dim": curses.A_DIM, "dimhead": curses.A_DIM,
