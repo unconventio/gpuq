@@ -358,66 +358,63 @@ def _bar(frac, n=10):
 
 
 def summary_lines(views, hosts, width=120):
-    """One line per GPU across the fleet: name, size, machine, memory and utilization, what runs
-    on it. Styled in the machine's color. It fits WIDTH by stepping down: 10-cell bars, 5-cell
-    bars, percentages only, then trimmed machine names; what runs is cut to the rest."""
+    """One line per GPU across the fleet, under a header row: GPU, machine (only when there are
+    several), memory, utilization, owner and model of what runs. Styled in the machine's color.
+    It fits WIDTH by stepping down: 10-cell bars, 5-cell bars, numbers only, trimmed machine
+    names; the model is cut to the rest."""
     facts = []
     for host, snap, err in views:
         idx = hosts.index(host) % 6
         if err or snap is None:
-            facts.append(dict(name="?", size="", host=host, used=None, gib=None, util=None,
-                              what="unreachable", st="m%d" % idx))
+            facts.append(dict(name="?", host=host, used=None, gib=None, shared=False, util=None,
+                              owner="", what="unreachable", st="m%d" % idx))
             continue
         cards = snap.get("cards") or {}
         card = snap.get("card") or (next(iter(cards)) if len(cards) == 1 else None)
         c = cards.get(card) or {}
-        gib = c.get("mib")
         m = (snap.get("meters") or {}).get(card) or {}
         q = snap["entries"]
         r = q[0] if q and q[0]["state"] in ("running", "yielding") else None
         if r:
-            what = "%s %s (%s)" % ("▶" if r["state"] == "running" else "⏏",
-                                   ",".join(r["models"]) or r["job"], r["owner"])
+            owner = ("▶ " if r["state"] == "running" else "⏏ ") + r["owner"]
+            what = ",".join(r["models"]) or r["job"]
         else:
-            what = "idle" if not q else "%d waiting" % len(q)
-        facts.append(dict(name=c.get("model") or card or host,
-                          # an iGPU borrows system RAM: up to that much, so "≤24 GB"
-                          size="%s%d GB" % ("≤" if c.get("integrated") else "", round(gib / 1024))
-                          if gib else "", host=host, used=m.get("used_mib"), gib=gib, util=m.get("util"),
-                          what=what, st="m%d" % idx))
-
+            owner, what = "", "idle" if not q else "%d waiting" % len(q)
+        facts.append(dict(name=c.get("model") or card or host, host=host, used=m.get("used_mib"),
+                          gib=c.get("mib"), shared=bool(c.get("integrated")), util=m.get("util"),
+                          owner=owner, what=what, st="m%d" % idx))
     many = len({f["host"] for f in facts}) > 1      # one machine: no machine column
-    heads = ["GPU", "SIZE", "HOST", "MEMORY", "LOAD"]
+    heads = ["GPU", "HOST", "MEM", "UTIL", "OWNER"]
 
-    def cols(f, bars, host_max, size=True):
+    def gbs(f):
+        """"6.5/24 GB"; an iGPU borrows system RAM, so up to that much: "0.9/≤24 GB"."""
+        tot = "%s%d" % ("≤" if f["shared"] else "", round(f["gib"] / 1024)) if f["gib"] else "?"
+        return "%s/%s GB" % ("%.1f" % (f["used"] / 1024) if f["used"] is not None else "?", tot)
+
+    def cols(f, bars, host_max):
         used, gib, util = f["used"], f["gib"], f["util"]
         frac = used / gib if used is not None and gib else None
         h = f["host"] if len(f["host"]) <= host_max else f["host"][:host_max - 1] + "…"
-        if bars:
-            mem = "%s %s" % (_bar(frac, bars), "%4.1f GB" % (used / 1024) if used is not None else "   ?   ")
-            gpu = "%s %s" % (_bar(util / 100 if util is not None else None, bars),
-                             "%3d%%" % util if util is not None else "  ?")
-        else:
-            mem = "%3d%%" % round(frac * 100) if frac is not None else "  ?"
-            gpu = "%3d%%" % util if util is not None else "  ?"
-        return [f["name"], f["size"] if size else "", h if many else "", mem, gpu]
+        mem = "%s %s" % (_bar(frac, bars), gbs(f)) if bars else gbs(f)
+        pct = "%3d%%" % util if util is not None else "  ?"
+        gpu = "%s %s" % (_bar(util / 100 if util is not None else None, bars), pct) if bars else pct
+        return [f["name"], h if many else "", mem, gpu, _trim(f["owner"], 14)]
 
-    def layout(bars, host_max, size=True):
-        rows = [cols(f, bars, host_max, size) for f in facts]
-        keep = [i for i in range(5) if any(r[i] for r in rows)]
+    def layout(bars, host_max):
+        rows = [cols(f, bars, host_max) for f in facts]
+        keep = [i for i in range(5) if any(r[i] for r in rows) or i == 4]
         widths = {i: max([len(r[i]) for r in rows] + [len(heads[i])]) for i in keep}
-        fmt = lambda r: "  " + "  ".join(r[i].ljust(widths[i]) for i in keep) + "   "
+        fmt = lambda r: "  " + "  ".join(r[i].ljust(widths[i]) for i in keep) + "  "
         return fmt(heads), [fmt(r) for r in rows]
 
     longest = max((len(f["host"]) for f in facts), default=0)
-    # (bar cells, longest machine name, show size): roomiest first, keep ~30 cells for what runs
-    steps = [(10, longest, True), (5, longest, True), (0, longest, True), (0, 12, True),
-             (0, 12, False), (0, 8, False)]
-    for bars, host_max, size in steps:
-        head, lead = layout(bars, host_max, size)
-        if max((len(x) for x in lead), default=0) + 30 <= width:
+    # (bar cells, longest machine name): roomiest first, keep ~20 cells for the model
+    steps = [(10, longest), (5, longest), (0, longest), (0, 12), (0, 8)]
+    for bars, host_max in steps:
+        head, lead = layout(bars, host_max)
+        if max((len(x) for x in lead), default=0) + 20 <= width:
             break
-    out = [((head + "RUNNING").rstrip(), "dim")] if facts else []
+    out = [((head + "MODEL").rstrip(), "dim")] if facts else []
     for x, f in zip(lead, facts):
         room = max(width - 1 - len(x), 0)
         out.append(((x + _trim(f["what"], room)).rstrip() if room else x.rstrip(), f["st"]))
