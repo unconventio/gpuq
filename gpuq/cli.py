@@ -1129,10 +1129,11 @@ def _tui(args):
         curses.init_pair(1, curses.COLOR_GREEN, -1)
         curses.init_pair(2, curses.COLOR_YELLOW, -1)
         curses.init_pair(3, curses.COLOR_RED, -1)
-        style = {"title": curses.A_REVERSE | curses.A_BOLD, "head": curses.A_REVERSE | curses.A_BOLD,
-                 "run": curses.color_pair(1) | curses.A_BOLD, "sel": curses.A_REVERSE | curses.A_BOLD,
-                 "warn": curses.color_pair(2) | curses.A_BOLD, "alert": curses.color_pair(3) | curses.A_BOLD,
-                 "wait": curses.A_NORMAL, "dim": curses.A_DIM, "dimhead": curses.A_REVERSE | curses.A_DIM,
+        # no bold; reverse video only for the selected job and the key bar
+        style = {"title": curses.A_NORMAL, "head": curses.A_UNDERLINE,
+                 "run": curses.color_pair(1), "sel": curses.A_REVERSE,
+                 "warn": curses.color_pair(2), "alert": curses.color_pair(3),
+                 "wait": curses.A_NORMAL, "dim": curses.A_DIM, "dimhead": curses.A_DIM,
                  "": curses.A_NORMAL}
         pal = [curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_BLUE,
                curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_BLUE]
@@ -1142,8 +1143,11 @@ def _tui(args):
         def resolve(st):
             """A fixed style name, or a GPU-colored header key 'h<idx>' (+ 's' when focused)."""
             if len(st) >= 2 and st[0] in "hm" and st[1].isdigit():
-                a = curses.color_pair(11 + int(st[1])) | curses.A_BOLD
-                return a | curses.A_REVERSE if st.endswith("s") else a
+                # machine color; in the summary the focused GPU (the tab) is in color, the rest dim
+                a = curses.color_pair(11 + int(st[1]))
+                if st[0] == "m" and not st.endswith("s"):
+                    return curses.A_DIM
+                return a
             return style.get(st, curses.A_NORMAL)
         scr.timeout(250)
         views, fetched, sh, sr, msg = fetch_views(hosts), time.time(), 0, 0, ""
