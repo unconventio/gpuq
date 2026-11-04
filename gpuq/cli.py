@@ -425,13 +425,14 @@ IND = " " * 8           # TUI: card info and jobs sit a tab in under the card's 
 DET = IND + " " * 7     # a job's detail lines, under its owner
 
 
-def tui_lines(views, sel_host, sel_row, now, width=80):
+def tui_lines(views, sel_host, sel_row, now, width=80, only_focus=False):
     """Screen content for the TUI as [(text, style)]. One roomy, color-coded block per GPU,
     showing its full listing: a colored header (the focused host's style ends in "s", and your
     own card is tagged ◀ YOU), what's on the card, then every queued job with its models, timing,
     progress, id (when selected) and why — nothing truncated away. A blank line separates GPUs.
     Styles: run / sel / warn / dim / head / "" / "h<idx>" (+ "s" when focused).
-    views = [(host, snap or None, error or None)]."""
+    views = [(host, snap or None, error or None)]. ONLY_FOCUS (the TUI): the summary works as
+    tabs, its focused row highlighted, and only the focused GPU's block is shown below it."""
     L, selected = [], None
     hosts = list(dict.fromkeys(v[0] for v in views))
     title = " GPU queue "
@@ -439,11 +440,17 @@ def tui_lines(views, sel_host, sel_row, now, width=80):
         title += "· " + ", ".join(hosts) + " "
     L.append((title, "title"))
     L.append(("", ""))
-    L.extend(summary_lines(views, hosts, width))
+    summ = summary_lines(views, hosts, width)
+    if only_focus and len(summ) > sel_host + 1:      # row 0 is the column header
+        t, st = summ[sel_host + 1]
+        summ[sel_host + 1] = ("▸ " + t[2:], st + "s")
+    L.extend(summ)
     L.append(("", ""))
     for hi, (host, snap, err) in enumerate(views):
         idx = hosts.index(host) % 6     # one color per machine, its cards share it
         focus = hi == sel_host
+        if only_focus and not focus:
+            continue
         mark = "▸ " if focus else "  "       # which host the keys act on
         hstyle = "h%ds" % idx if focus else "h%d" % idx
         if err or snap is None:
@@ -1100,7 +1107,7 @@ def fetch_views(hosts):
     return views
 
 
-TUI_KEYS = " ↑↓ select · k/Shift-↑ move up (sooner) · j/Shift-↓ move down (later) · d remove · p pause/resume · Tab/←→ host · r refresh · q quit "
+TUI_KEYS = " ↑↓ select · k/Shift-↑ move up (sooner) · j/Shift-↓ move down (later) · d remove · p pause/resume · Tab/←→ GPU · r refresh · q quit "
 
 
 # Shift-↑/↓ as raw escape sequences, for terminals whose terminfo doesn't decode them
@@ -1171,7 +1178,7 @@ def _tui(args):
             sr = max(0, min(sr, len(entries()) - 1))
             h, w = scr.getmaxyx()
             scr.erase()
-            for y, (text, st) in enumerate(tui_lines(views, sh, sr, time.time(), w)[:h - 1]):
+            for y, (text, st) in enumerate(tui_lines(views, sh, sr, time.time(), w, only_focus=True)[:h - 1]):
                 put(y, text, resolve(st))
             put(h - 1, msg or TUI_KEYS, curses.A_REVERSE)
             scr.refresh()

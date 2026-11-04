@@ -412,3 +412,19 @@ class Priority(unittest.TestCase):
         self.c.start(q, 0, q[0]["id"])
         ns = type("A", (), {"priority": None, "level": "preempt"})()
         self.assertEqual(cli.want_priority(ns, q), 21)
+
+
+class TuiTabs(unittest.TestCase):
+    def test_only_the_focused_gpu_is_listed(self):
+        from gpuq import cli as g, core
+        views = []
+        for h in ("a", "b"):
+            q = []
+            core.join(q, 0, "own-" + h, "job-" + h)
+            views.append((h, {"host": h, "entries": q, "now": 0, "cards": {}, "history": []}, None))
+        text = "\n".join(t for t, _ in g.tui_lines(views, 1, 0, 0, 100, only_focus=True))
+        self.assertIn("own-b", text)
+        self.assertNotIn("own-a  —", text)
+        rows = [(t, st) for t, st in g.tui_lines(views, 1, 0, 0, 100, only_focus=True) if st.startswith("m")]
+        self.assertTrue(rows[1][0].startswith("▸") and rows[1][1].endswith("s"))
+        self.assertFalse(rows[0][1].endswith("s"))
