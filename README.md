@@ -31,8 +31,11 @@ State lives in `~/.local/state/gpuq` (override: `$GPUQ_STATE`). Run `gpuq sweep`
 `examples/gpuq.desktop` puts "GPU Queue" in your app menu, like htop's entry, so the live view opens in its own
 window and closes without a "running program" prompt. Copy it to `~/.local/share/applications/`. It uses your
 default terminal at its default size.
-For a bigger window (130x40 fits the full layout with bars and the model column), set `Terminal=false` and start
-the terminal yourself on the `Exec=` line:
+
+A bigger window (130x40 fits the full layout with bars and the model column) takes one more step. With
+`Terminal=true` the desktop picks the terminal, and a desktop file has no way to ask it for a size, so there is no
+setting that works everywhere. Instead set `Terminal=false` and start a terminal yourself on the `Exec=` line, with
+that terminal's own size option:
 
 | terminal | `Exec=` |
 |---|---|
