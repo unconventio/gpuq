@@ -181,7 +181,7 @@ def entry_timings(q, now):
     return out
 
 
-PALETTE = [36, 35, 33, 32, 34, 31]  # per-GPU colours: cyan, magenta, yellow, green, blue, red
+PALETTE = [36, 35, 33, 32, 34, 31]  # per-GPU colors: cyan, magenta, yellow, green, blue, red
 
 
 def _sgr(s, on, *codes):
@@ -263,7 +263,7 @@ def _render_card(view, color):
 
 
 def _render_cards(snap, views, color):
-    """Each GPU as a colour-ruled card, a blank line between, recent log pulled out below."""
+    """Each GPU as a color-ruled card, a blank line between, recent log pulled out below."""
     w = _termwidth()
     out = []
     for idx, view in enumerate(views):
@@ -279,7 +279,7 @@ def _render_cards(snap, views, color):
 
 
 def _render_bars(snap, views, color):
-    """Each GPU gets a coloured left gutter bar, a blank line between."""
+    """Each GPU gets a colored left gutter bar, a blank line between."""
     out = []
     for idx, view in enumerate(views):
         code = PALETTE[idx % len(PALETTE)]
@@ -294,7 +294,7 @@ def _render_bars(snap, views, color):
 
 
 def _render_list(snap, views, color):
-    """One compact line per GPU: a coloured dot, name, mem, state; your card gets an arrow."""
+    """One compact line per GPU: a colored dot, name, mem, state; your card gets an arrow."""
     out = ["GPUs"]
     for idx, view in enumerate(views):
         code = PALETTE[idx % len(PALETTE)]
@@ -357,37 +357,66 @@ def _bar(frac, n=10):
     return "█" * k + "░" * (n - k)
 
 
-def summary_lines(views, hosts):
-    """One line per GPU across the fleet: name, size, machine, what runs on it, memory and
-    utilisation bars. Styled in the machine's colour."""
-    rows = []
+def summary_lines(views, hosts, width=120):
+    """One line per GPU across the fleet: name, size, machine, memory and utilization, what runs
+    on it. Styled in the machine's color. It fits WIDTH by stepping down: 10-cell bars, 5-cell
+    bars, percentages only, then trimmed machine names; what runs is cut to the rest."""
+    facts = []
     for host, snap, err in views:
         idx = hosts.index(host) % 6
         if err or snap is None:
-            rows.append((["?", "", "@ " + host, "", "", "unreachable"], "m%d" % idx))
+            facts.append(dict(name="?", size="", host=host, used=None, gib=None, util=None,
+                              what="unreachable", st="m%d" % idx))
             continue
         cards = snap.get("cards") or {}
         card = snap.get("card") or (next(iter(cards)) if len(cards) == 1 else None)
         c = cards.get(card) or {}
         gib = c.get("mib")
-        size = "%d GB%s" % (round(gib / 1024), " shared" if c.get("integrated") else "") if gib else ""
         m = (snap.get("meters") or {}).get(card) or {}
-        used, util = m.get("used_mib"), m.get("util")
-        mem = "mem %s %s" % (_bar(used / gib if used is not None and gib else None),
-                             "%4.1f GB" % (used / 1024) if used is not None else "   ? ")
-        gpu = "gpu %s %s" % (_bar(util / 100 if util is not None else None),
-                             "%3d%%" % util if util is not None else "  ?")
         q = snap["entries"]
         r = q[0] if q and q[0]["state"] in ("running", "yielding") else None
         if r:
             what = "%s %s (%s)" % ("▶" if r["state"] == "running" else "⏏",
-                                   ",".join(r["models"]) or _trim(r["job"], 24), r["owner"][:12])
+                                   ",".join(r["models"]) or r["job"], r["owner"])
         else:
             what = "idle" if not q else "%d waiting" % len(q)
-        rows.append(([c.get("model") or card or host, size, "@ " + host, mem, gpu, what], "m%d" % idx))
-    widths = [max(len(r[0][i]) for r in rows) for i in range(5)] if rows else []
-    return [("  " + "  ".join(f.ljust(widths[i]) for i, f in enumerate(cols[:5])) + "   " + cols[5], st)
-            for cols, st in rows]
+        facts.append(dict(name=c.get("model") or card or host,
+                          size="%d GB%s" % (round(gib / 1024), " shared" if c.get("integrated") else "")
+                          if gib else "", host=host, used=m.get("used_mib"), gib=gib, util=m.get("util"),
+                          what=what, st="m%d" % idx))
+
+    def cols(f, bars, host_max, size=True):
+        used, gib, util = f["used"], f["gib"], f["util"]
+        frac = used / gib if used is not None and gib else None
+        h = f["host"] if len(f["host"]) <= host_max else f["host"][:host_max - 1] + "…"
+        if bars:
+            mem = "mem %s %s" % (_bar(frac, bars), "%4.1f GB" % (used / 1024) if used is not None else "   ?   ")
+            gpu = "gpu %s %s" % (_bar(util / 100 if util is not None else None, bars),
+                                 "%3d%%" % util if util is not None else "  ?")
+        else:
+            mem = "mem %s" % ("%3d%%" % round(frac * 100) if frac is not None else "  ?")
+            gpu = "gpu %s" % ("%3d%%" % util if util is not None else "  ?")
+        return [f["name"], f["size"] if size else "", "@ " + h, mem, gpu]
+
+    def layout(bars, host_max, size=True):
+        rows = [cols(f, bars, host_max, size) for f in facts]
+        widths = [max(len(r[i]) for r in rows) for i in range(5)] if rows else []
+        return ["  " + "  ".join(x.ljust(widths[i]) for i, x in enumerate(r) if widths[i]) + "   "
+                for r in rows]
+
+    longest = max((len(f["host"]) for f in facts), default=0)
+    # (bar cells, longest machine name, show size): roomiest first, keep ~30 cells for what runs
+    steps = [(10, longest, True), (5, longest, True), (0, longest, True), (0, 12, True),
+             (0, 12, False), (0, 8, False)]
+    for bars, host_max, size in steps:
+        lead = layout(bars, host_max, size)
+        if max((len(x) for x in lead), default=0) + 30 <= width:
+            break
+    out = []
+    for x, f in zip(lead, facts):
+        room = max(width - 1 - len(x), 0)
+        out.append(((x + _trim(f["what"], room)).rstrip() if room else x.rstrip(), f["st"]))
+    return out
 
 
 IND = " " * 8           # TUI: card info and jobs sit a tab in under the card's rule
@@ -395,8 +424,8 @@ DET = IND + " " * 7     # a job's detail lines, under its owner
 
 
 def tui_lines(views, sel_host, sel_row, now, width=80):
-    """Screen content for the TUI as [(text, style)]. One roomy, colour-coded block per GPU,
-    showing its full listing: a coloured header (the focused host's style ends in "s", and your
+    """Screen content for the TUI as [(text, style)]. One roomy, color-coded block per GPU,
+    showing its full listing: a colored header (the focused host's style ends in "s", and your
     own card is tagged ◀ YOU), what's on the card, then every queued job with its models, timing,
     progress, id (when selected) and why — nothing truncated away. A blank line separates GPUs.
     Styles: run / sel / warn / dim / head / "" / "h<idx>" (+ "s" when focused).
@@ -408,10 +437,10 @@ def tui_lines(views, sel_host, sel_row, now, width=80):
         title += "· " + ", ".join(hosts) + " "
     L.append((title, "title"))
     L.append(("", ""))
-    L.extend(summary_lines(views, hosts))
+    L.extend(summary_lines(views, hosts, width))
     L.append(("", ""))
     for hi, (host, snap, err) in enumerate(views):
-        idx = hosts.index(host) % 6     # one colour per machine, its cards share it
+        idx = hosts.index(host) % 6     # one color per machine, its cards share it
         focus = hi == sel_host
         mark = "▸ " if focus else "  "       # which host the keys act on
         hstyle = "h%ds" % idx if focus else "h%d" % idx
@@ -972,7 +1001,7 @@ def _place_residents(use, residents):
 
 
 def card_meters(cards):
-    """{card: {"used_mib", "util"}}: memory in use and utilisation percent per card, for the TUI's
+    """{card: {"used_mib", "util"}}: memory in use and utilization percent per card, for the TUI's
     summary bars. nvidia-smi for NVIDIA; sysfs for AMD (an iGPU's memory is its GTT use).
     Either value may be None. Empty under GPUQ_CARDS (the tests' fake cards)."""
     out = {}
@@ -1086,8 +1115,8 @@ def _tui(args):
     def loop(scr):
         curses.curs_set(0)
         curses.use_default_colors()
-        # colour has meaning: green = running, yellow = yielding, red = needs a human,
-        # dim = detail; machines get their own colours from a palette that avoids those three
+        # color has meaning: green = running, yellow = yielding, red = needs a human,
+        # dim = detail; machines get their own colors from a palette that avoids those three
         curses.init_pair(1, curses.COLOR_GREEN, -1)
         curses.init_pair(2, curses.COLOR_YELLOW, -1)
         curses.init_pair(3, curses.COLOR_RED, -1)
@@ -1102,7 +1131,7 @@ def _tui(args):
             curses.init_pair(11 + i, c, -1)
 
         def resolve(st):
-            """A fixed style name, or a GPU-coloured header key 'h<idx>' (+ 's' when focused)."""
+            """A fixed style name, or a GPU-colored header key 'h<idx>' (+ 's' when focused)."""
             if len(st) >= 2 and st[0] in "hm" and st[1].isdigit():
                 a = curses.color_pair(11 + int(st[1])) | curses.A_BOLD
                 return a | curses.A_REVERSE if st.endswith("s") else a

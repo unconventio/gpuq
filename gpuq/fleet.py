@@ -15,7 +15,7 @@ import urllib.request
 from .core import join, jump, remaining
 
 # Resident presets: `{"type": "ollama"}` in the config fills these in. Everything is overridable.
-#   match     process name as gpuq sees it (nvidia-smi / fdinfo), used to recognise the resident
+#   match     process name as gpuq sees it (nvidia-smi / fdinfo), used to recognize the resident
 #   unit      systemd user unit (evac restarts it pinned to another card; free may stop it)
 #   free      how `gpuq free` releases its memory: "ollama" / "llama-swap" unload over HTTP,
 #             "stop" stops the unit (restore starts it again), or a shell command

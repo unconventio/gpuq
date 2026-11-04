@@ -1,6 +1,6 @@
 """AMD support: cards come from sysfs, usage from DRM fdinfo. Fixture trees below copy the shape
 (and the numbers) of a real Radeon 880M laptop (Strix Point, amdgpu, no amd-smi); the discrete
-card is synthetic, modelled on what amdgpu exposes for an RX 7900 XTX."""
+card is synthetic, modeled on what amdgpu exposes for an RX 7900 XTX."""
 import json
 import os
 import subprocess

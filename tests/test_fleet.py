@@ -144,7 +144,7 @@ class CLI(unittest.TestCase):
         snap, _ = self.js("show", "--json")
         e = snap["lines"]["3060"][0]
         self.assertEqual((e["models"], e["vram_gb"], e["tags"]), (["m1", "m2"], 8, ["cuda"]))
-        r = self.cli("join", "--spec", "-", stdin='{"owner": "a", "job": "j", "colour": "red"}')
+        r = self.cli("join", "--spec", "-", stdin='{"owner": "a", "job": "j", "color": "red"}')
         self.assertEqual(r.returncode, 2)
         self.assertIn("unknown key", r.stderr)
         self.assertEqual(self.cli("join", "--owner", "a").returncode, 2)

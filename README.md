@@ -108,7 +108,7 @@ Residents are declared per card, either as a process name (the old form) or as a
 |---|---|
 | `type` | a preset: `ollama`, `vllm`, `llama-server`, `llama-swap` (fills in the fields below) |
 | `name` | label (default: the type or process name) |
-| `match` | process name as gpuq sees it, to recognise it on a card |
+| `match` | process name as gpuq sees it, to recognize it on a card |
 | `unit` | its systemd user unit (`evac` restarts it pinned elsewhere; `free` may stop it) |
 | `vram_gb` | memory it normally holds; `vram_frac` = a share of the card (the vLLM preset assumes 0.9) |
 | `free` | how `gpuq free` releases it: `ollama` / `llama-swap` (unload over HTTP at `url`), `stop` (stop the unit; `restore` starts it), or a shell command |
