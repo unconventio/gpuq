@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=GPU Queue
+Comment=Live view of the GPU queue on every machine
+Exec=gpuq
+Terminal=true
+Icon=utilities-system-monitor
+Categories=System;Monitor;ConsoleOnly;
+Keywords=gpu;queue;nvidia;rocm;
