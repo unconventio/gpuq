@@ -1129,8 +1129,8 @@ def _tui(args):
         curses.init_pair(1, curses.COLOR_GREEN, -1)
         curses.init_pair(2, curses.COLOR_YELLOW, -1)
         curses.init_pair(3, curses.COLOR_RED, -1)
-        # no bold; reverse video only for the selected job and the key bar
-        style = {"title": curses.A_NORMAL, "head": curses.A_UNDERLINE,
+        # bold only for the title; reverse video only for the selected job and the key bar
+        style = {"title": curses.A_BOLD, "head": curses.A_UNDERLINE,
                  "run": curses.color_pair(1), "sel": curses.A_REVERSE,
                  "warn": curses.color_pair(2), "alert": curses.color_pair(3),
                  "wait": curses.A_NORMAL, "dim": curses.A_DIM, "dimhead": curses.A_DIM,
