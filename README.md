@@ -28,12 +28,9 @@ State lives in `~/.local/state/gpuq` (override: `$GPUQ_STATE`). Run `gpuq sweep`
 
 ### An app-menu launcher
 
-`gpuq` at a terminal opens the live view. Started from a shell prompt, closing the window makes most terminals ask
-"close this window with a running program?", because gpuq is a program running under your shell. Started by a
-launcher, gpuq is the window's own program and the window closes quietly, as htop does. The view only reads the
-queue, so closing it never affects a job.
-
-Copy `examples/gpuq.desktop` to `~/.local/share/applications/`. It uses your default terminal at its default size.
+`examples/gpuq.desktop` puts "GPU Queue" in your app menu, like htop's entry, so the live view opens in its own
+window and closes without a "running program" prompt. Copy it to `~/.local/share/applications/`. It uses your
+default terminal at its default size.
 For a bigger window (130x40 fits the full layout with bars and the model column), set `Terminal=false` and start
 the terminal yourself on the `Exec=` line:
 
