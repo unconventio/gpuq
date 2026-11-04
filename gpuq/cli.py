@@ -119,10 +119,10 @@ def header(snap, now):
     if card:
         c = cards.get(card) or {}
         gib = c.get("mib")
-        where += " · %s%s" % (c.get("model") or card,
-                              " (%d GB%s)" % (round(gib / 1024), " shared" if c.get("integrated") else "")
-                              if gib else "")
-    # machine and card, then the running job in brief: who/what, model, ETA; its id goes last
+        where = "%s%s · %s" % (c.get("model") or card,
+                               " (%d GB%s)" % (round(gib / 1024), " shared" if c.get("integrated") else "")
+                               if gib else "", snap["host"])
+    # card and machine, then the running job in brief: who/what, model, ETA; its id goes last
     r = q[0] if q and q[0]["state"] in ("running", "yielding") else None
     if r:
         text = "%s · %s %s: %s" % (where, "▶" if r["state"] == "running" else "⏏",
@@ -327,7 +327,7 @@ def warnings(snap):
     out = []
     loaded = snap.get("loaded")
     if loaded is not None:
-        text = "GPU in use: %s" % (", ".join(loaded) or "nothing over 1 GB")
+        text = "processes on this card: %s" % (", ".join(loaded) or "none over 1 GB")
         if snap.get("busy") is not None:
             text += " · busy %d%%" % snap["busy"]
         if snap.get("residents"):
@@ -442,9 +442,9 @@ def tui_lines(views, sel_host, sel_row, now, width=80, only_focus=False):
     L.append(("", ""))
     summ = summary_lines(views, hosts, width)
     if only_focus and len(summ) > sel_host + 1:      # row 0 is the column header
-        t, st = summ[sel_host + 1]
+        t, st = summ[sel_host + 1]      # the focused GPU: in color, the others dim
         base_st, _, span = st.partition("|")
-        summ[sel_host + 1] = ("▸ " + t[2:], base_st + "s" + ("|" + span if span else ""))
+        summ[sel_host + 1] = (t, base_st + "s" + ("|" + span if span else ""))
     L.extend(summ)
     L.append(("", ""))
     for hi, (host, snap, err) in enumerate(views):
@@ -452,22 +452,22 @@ def tui_lines(views, sel_host, sel_row, now, width=80, only_focus=False):
         focus = hi == sel_host
         if only_focus and not focus:
             continue
-        mark = "▸ " if focus else "  "       # which host the keys act on
+        mark = "" if only_focus else "▸ " if focus else "  "   # which card the keys act on
         hstyle = "h%ds" % idx if focus else "h%d" % idx
         if err or snap is None:
             L.append((mark + (err or host + ": no data"), hstyle))
             L.append(("", ""))
             continue
         q = snap["entries"]
-        you = "   ◀ YOU" if _is_current(snap) else ""
+        you = "" if only_focus else "   ◀ YOU" if _is_current(snap) else ""
         base = header(snap, now)
         rule = "─" * max(2, width - len(mark) - len(base) - len(you) - 2)
         line = mark + base + " " + rule + you
         cards = snap.get("cards") or {}
         cname = snap.get("card") or (next(iter(cards)) if len(cards) == 1 else None)
         model = (cards.get(cname) or {}).get("model") or cname or ""
-        at = line.find(" · " + model) + 3 if model and (" · " + model) in line else -1
-        L.append((line, hstyle + ("|b%d:%d" % (at, at + len(model)) if at >= 3 else "")))
+        at = line.find(model) if model else -1
+        L.append((line, hstyle + ("|b%d:%d" % (at, at + len(model)) if at >= 0 else "")))
         L.append(("", ""))
         for w in warnings(snap):
             L.append((IND + w, "alert" if w.startswith("⚠") else "dim"))

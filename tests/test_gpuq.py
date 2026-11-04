@@ -336,8 +336,8 @@ class TuiLayout(unittest.TestCase):
         v[1] = ("hostB", g.snapshot([], T0, [], None, host="hostB"), None)
         heads = [(t, st) for t, st in g.tui_lines(v, 1, 0, T0)
                  if st.startswith("h") and st[1:2].isdigit()]
-        self.assertTrue(heads[0][0].startswith("  hostA") and not heads[0][1].endswith("s"))
-        self.assertTrue(heads[1][0].startswith("▸ hostB") and heads[1][1].endswith("s"))
+        self.assertTrue(heads[0][0].startswith("  ") and "hostA" in heads[0][0] and not heads[0][1].endswith("s"))
+        self.assertTrue(heads[1][0].startswith("▸ ") and "hostB" in heads[1][0] and heads[1][1].endswith("s"))
 
     def test_unreachable_host_is_a_header_not_a_crash(self):
         lines = g.tui_lines(self.views(), 1, 0, T0)
@@ -667,7 +667,7 @@ class Residents(unittest.TestCase):
         self.assertIn("residents: whisper-server", out)
         self.assertIn("unqueued GPU use", out)          # the 3060's ollama, nothing queued there
         tui = g.tui_lines([("hostB", v, None) for v in views], 1, 0, T0)
-        self.assertTrue(any("hostB · 3060" in t for t, _ in tui))
+        self.assertTrue(any("3060 (12 GB) · hostB" in t for t, _ in tui))
 
 
 if __name__ == "__main__":

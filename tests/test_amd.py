@@ -172,7 +172,7 @@ class Usage(Fixture):
         self.assertEqual(snap["loaded"] and snap["loaded"][0].split()[0], "worker")
         view = g.per_card(snap)[0]
         self.assertIn("shared", g.header(dict(snap, card="880M"), snap["now"]))
-        self.assertIn("GPU in use: worker", "\n".join(g.warnings(dict(snap, busy=97))))
+        self.assertIn("processes on this card: worker", "\n".join(g.warnings(dict(snap, busy=97))))
         self.assertIn("busy 97%", "\n".join(g.warnings(dict(snap, busy=97))))
         self.assertTrue(view)
 

@@ -426,5 +426,5 @@ class TuiTabs(unittest.TestCase):
         self.assertIn("own-b", text)
         self.assertNotIn("own-a  —", text)
         rows = [(t, st) for t, st in g.tui_lines(views, 1, 0, 0, 100, only_focus=True) if st.startswith("m")]
-        self.assertTrue(rows[1][0].startswith("▸") and rows[1][1].partition("|")[0].endswith("s"))
+        self.assertTrue(rows[1][1].partition("|")[0].endswith("s"))
         self.assertFalse(rows[0][1].partition("|")[0].endswith("s"))

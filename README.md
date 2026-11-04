@@ -153,7 +153,7 @@ shared memory (`880M (24 GB shared)`), and a discrete card is preferred as the h
 with `cards.<name>.vram_gb` (`gpuq init` proposes half). Jobs on an AMD card get `ROCR_VISIBLE_DEVICES` (the ROCm
 device index, or `GPU-<unique id>` when the card has one); `gpuq run` sets it, and `gpuq start` / `gpuq env ID` print
 it. Only `ROCR_VISIBLE_DEVICES` is set, not `HIP_VISIBLE_DEVICES`, because HIP applies its own filter on top of ROCm's
-and the two would compound. "GPU in use" lists processes holding at least 1 GB, read from the kernel's DRM fdinfo
+and the two would compound. "processes on this card" lists processes holding at least 1 GB, read from the kernel's DRM fdinfo
 (needs kernel 5.19+ for the memory keys; you only see processes you are allowed to inspect), plus `gpu_busy_percent`.
 Not covered: Intel GPUs, Vulkan-only devices without `amdgpu`, and a job that spans several cards. A host that has
 neither tool still works as a plain numbered line without pinning or usage warnings. Mixed NVIDIA + AMD hosts get one
