@@ -1,3 +1,7 @@
+# App-menu launcher for the gpuq live view: copy to ~/.local/share/applications/.
+# Started this way gpuq is the window's own program, so closing the window doesn't ask
+# "close with a running program?". For a bigger window, set Terminal=false and launch the
+# terminal yourself, e.g.  Exec=gnome-terminal --geometry=130x40 -- gpuq  (README: launcher).
 [Desktop Entry]
 Type=Application
 Name=GPU Queue

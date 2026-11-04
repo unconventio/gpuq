@@ -26,6 +26,28 @@ an honest, visible line and flags GPU use that did not go through it.
 State lives in `~/.local/state/gpuq` (override: `$GPUQ_STATE`). Run `gpuq sweep` every minute from a timer
 (systemd user timer or cron); it purges dead holders.
 
+### An app-menu launcher
+
+`gpuq` at a terminal opens the live view. Started from a shell prompt, closing the window makes most terminals ask
+"close this window with a running program?", because gpuq is a program running under your shell. Started by a
+launcher, gpuq is the window's own program and the window closes quietly, as htop does. The view only reads the
+queue, so closing it never affects a job.
+
+Copy `examples/gpuq.desktop` to `~/.local/share/applications/`. It uses your default terminal at its default size.
+For a bigger window (130x40 fits the full layout with bars and the model column), set `Terminal=false` and start
+the terminal yourself on the `Exec=` line:
+
+| terminal | `Exec=` |
+|---|---|
+| GNOME Terminal | `gnome-terminal --geometry=130x40 -- gpuq` |
+| Konsole | `konsole -p TerminalColumns=130 -p TerminalRows=40 -e gpuq` |
+| kitty | `kitty -o initial_window_width=130c -o initial_window_height=40c gpuq` |
+| xterm | `xterm -geometry 130x40 -e gpuq` |
+
+Some terminals (Ptyxis, for one) can't set a window size per launch, only a default size for every window;
+use another terminal for the launcher, or change that default. Use the full path to `gpuq` if the menu's PATH
+lacks `~/.local/bin`.
+
 ## Quickstart
 
     gpuq where --vram 16                 # which card, on which machine, how soon
