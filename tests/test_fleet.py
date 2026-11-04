@@ -362,7 +362,7 @@ class Display(unittest.TestCase):
         self.assertNotIn(" a ", text)
         self.assertIn("█████░░░░░", text)
         self.assertIn("idle", text)
-        self.assertEqual(st, "m0")
+        self.assertEqual(st.partition("|")[0], "m0")
 
 
 class Priority(unittest.TestCase):
@@ -426,5 +426,5 @@ class TuiTabs(unittest.TestCase):
         self.assertIn("own-b", text)
         self.assertNotIn("own-a  —", text)
         rows = [(t, st) for t, st in g.tui_lines(views, 1, 0, 0, 100, only_focus=True) if st.startswith("m")]
-        self.assertTrue(rows[1][0].startswith("▸") and rows[1][1].endswith("s"))
-        self.assertFalse(rows[0][1].endswith("s"))
+        self.assertTrue(rows[1][0].startswith("▸") and rows[1][1].partition("|")[0].endswith("s"))
+        self.assertFalse(rows[0][1].partition("|")[0].endswith("s"))

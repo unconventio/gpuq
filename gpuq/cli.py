@@ -417,7 +417,8 @@ def summary_lines(views, hosts, width=120):
     out = [((head + "MODEL").rstrip(), "dim")] if facts else []
     for x, f in zip(lead, facts):
         room = max(width - 1 - len(x), 0)
-        out.append(((x + _trim(f["what"], room)).rstrip() if room else x.rstrip(), f["st"]))
+        out.append(((x + _trim(f["what"], room)).rstrip() if room else x.rstrip(),
+                    "%s|b2:%d" % (f["st"], 2 + len(f["name"]))))
     return out
 
 
@@ -435,15 +436,15 @@ def tui_lines(views, sel_host, sel_row, now, width=80, only_focus=False):
     tabs, its focused row highlighted, and only the focused GPU's block is shown below it."""
     L, selected = [], None
     hosts = list(dict.fromkeys(v[0] for v in views))
-    title = " GPU queue "
-    if len(hosts) > 1:
-        title += "· " + ", ".join(hosts) + " "
-    L.append((title, "title"))
+    title = " GPU Queue · %s " % ", ".join(hosts)
+    side = max(2, (width - 1 - len(title)) // 2)
+    L.append((("─" * side + title + "─" * side)[:max(width - 1, 0)], "title"))
     L.append(("", ""))
     summ = summary_lines(views, hosts, width)
     if only_focus and len(summ) > sel_host + 1:      # row 0 is the column header
         t, st = summ[sel_host + 1]
-        summ[sel_host + 1] = ("▸ " + t[2:], st + "s")
+        base_st, _, span = st.partition("|")
+        summ[sel_host + 1] = ("▸ " + t[2:], base_st + "s" + ("|" + span if span else ""))
     L.extend(summ)
     L.append(("", ""))
     for hi, (host, snap, err) in enumerate(views):
@@ -461,7 +462,12 @@ def tui_lines(views, sel_host, sel_row, now, width=80, only_focus=False):
         you = "   ◀ YOU" if _is_current(snap) else ""
         base = header(snap, now)
         rule = "─" * max(2, width - len(mark) - len(base) - len(you) - 2)
-        L.append((mark + base + " " + rule + you, hstyle))
+        line = mark + base + " " + rule + you
+        cards = snap.get("cards") or {}
+        cname = snap.get("card") or (next(iter(cards)) if len(cards) == 1 else None)
+        model = (cards.get(cname) or {}).get("model") or cname or ""
+        at = line.find(" · " + model) + 3 if model and (" · " + model) in line else -1
+        L.append((line, hstyle + ("|b%d:%d" % (at, at + len(model)) if at >= 3 else "")))
         L.append(("", ""))
         for w in warnings(snap):
             L.append((IND + w, "alert" if w.startswith("⚠") else "dim"))
@@ -1129,8 +1135,8 @@ def _tui(args):
         curses.init_pair(1, curses.COLOR_GREEN, -1)
         curses.init_pair(2, curses.COLOR_YELLOW, -1)
         curses.init_pair(3, curses.COLOR_RED, -1)
-        # bold only for the title; reverse video only for the selected job and the key bar
-        style = {"title": curses.A_BOLD, "head": curses.A_UNDERLINE,
+        # bold: the title and GPU names; reverse video: the title, the selected job, the key bar. for the selected job and the key bar
+        style = {"title": curses.A_BOLD | curses.A_REVERSE, "head": curses.A_UNDERLINE,
                  "run": curses.color_pair(1), "sel": curses.A_REVERSE,
                  "warn": curses.color_pair(2), "alert": curses.color_pair(3),
                  "wait": curses.A_NORMAL, "dim": curses.A_DIM, "dimhead": curses.A_DIM,
@@ -1170,9 +1176,12 @@ def _tui(args):
             card = (views[sh][1] or {}).get("card")
             return ["--gpu", card] if card else []
 
-        def put(y, text, attr):
+        def put(y, text, attr, bold=None):
             try:
                 scr.addnstr(y, 0, text.ljust(w), w - 1, attr)
+                if bold and bold[0] < w - 1:
+                    a, b = bold
+                    scr.addnstr(y, a, text[a:b], max(min(b, w - 1) - a, 0), attr | curses.A_BOLD)
             except curses.error:
                 pass
 
@@ -1183,7 +1192,9 @@ def _tui(args):
             h, w = scr.getmaxyx()
             scr.erase()
             for y, (text, st) in enumerate(tui_lines(views, sh, sr, time.time(), w, only_focus=True)[:h - 1]):
-                put(y, text, resolve(st))
+                st, _, span = st.partition("|")
+                bold = tuple(int(x) for x in span[1:].split(":")) if span.startswith("b") else None
+                put(y, text, resolve(st), bold)
             put(h - 1, msg or TUI_KEYS, curses.A_REVERSE)
             scr.refresh()
             k = scr.getch()
