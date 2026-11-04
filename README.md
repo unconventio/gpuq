@@ -39,7 +39,7 @@ State lives in `~/.local/state/gpuq` (override: `$GPUQ_STATE`). Run `gpuq sweep`
 
 | call | meaning |
 |---|---|
-| `gpuq join ...` | get in line, prints an id. `--vram GB` / `--tag T` pick a card that fits (shortest wait, then the smallest card); `--gpu` names one. `--est` minutes (default: the median of this job's past runs); `--important` stops short jobs jumping you. `--spec FILE` (or `-` for stdin) reads all of it as one JSON object |
+| `gpuq join ...` | get in line, prints an id. `--vram GB` / `--tag T` pick a card that fits (shortest wait, then the smallest card); `--gpu` names one. `--est` minutes (default: the median of this job's past runs). `--priority chill\|normal\|important\|ablaze\|preempt\|N` (below) `--spec FILE` (or `-` for stdin) reads all of it as one JSON object |
 | `gpuq start ID` | exit 0 = you hold the card. Exit **3** = not your turn yet (or a yield was acknowledged): retry in a minute. Prints `CUDA_VISIBLE_DEVICES=GPU-<uuid>` (or `ROCR_VISIBLE_DEVICES=…`) on multi-card hosts |
 | `gpuq beat ID [--progress 41/80]` | heartbeat, about every 60 s (silent 15 min = purged). Exit **4** = you were purged: stop. Exit **5** = yield: stop your GPU work, go back to polling `start` |
 | `gpuq done ID` | finished, leave the line |
@@ -63,10 +63,15 @@ Hand-rolled holder loop:
       work finished on its own -> gpuq done $ID; exit
     done
 
+Priority: any integer, higher goes first; the names are defaults: `chill` 5 (☾), `normal` 10, `important` 20 (★),
+`ablaze` 30 (⚑), and `preempt` = one above the running job's. A joining job goes just behind the last job of at least
+its priority, and outranking the running job asks it to yield (it resumes after). `--chill`, `--important`, `--ablaze`
+and `--preempt` are shortcuts; `gpuq edit ID --priority …` re-places a job.
+
 Rules of the line: a yield is asked by moving the running job down (`gpuq mv 1 3`, TUI `j`, or `gpuq yield ID`).
 The yielder keeps the card until its next `start` acknowledges. A waiting #1 that does not `start` within 15 min is
 skipped to the back (twice: removed). A job of at most 6 h goes ahead of jobs with 10x more time left (decided at
-`join`/`edit` only, never otherwise) unless they are `--important`. A pause (`gpuq pause`) lets nobody start.
+`join`/`edit` only, never otherwise) unless they are important (priority 20+) or outrank it. A pause (`gpuq pause`) lets nobody start.
 
 ## MCP
 
@@ -130,6 +135,7 @@ Optional JSON at `~/.config/gpuq/config.json` (`$GPUQ_CONFIG`); `gpuq init` writ
 | `units` | `{process name: systemd user unit}` for old-form residents (default `<name>.service`) |
 | `hosts` | comma list for the multi-host views and `where` (default: this host) |
 | `remote_command` | gpuq on other hosts over non-interactive ssh (default `~/.local/bin/gpuq`) |
+| `rules` | `{"jump_ratio": 10, "jump_max_hours": 6, "priorities": {"chill": 5, "normal": 10, "important": 20, "ablaze": 30}}` |
 | `compat_lock` | a lock file for older tools; written while a job runs, removed after |
 
 ## Cards and hosts

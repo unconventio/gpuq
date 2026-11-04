@@ -54,7 +54,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .core import *  # noqa: F401,F403  (pure queue operations, re-exported for callers)
-from .core import QueueError, fmt_dur, yielding, running, normalize, find, remove
+from .core import QueueError, fmt_dur, yielding, running, normalize, find, remove, prio, prio_mark, place, PRIORITY
 from . import fleet
 
 HOST = socket.gethostname()
@@ -215,7 +215,7 @@ def _body_lines(view, color):
         if e["state"] == "running":
             beat_age = "beat %s ago" % fmt_dur(now - (e["heartbeat"] or e["started"]))
             line = "%2d ▶ RUNNING %s%-12s %-28s %s · %s · %s" % (
-                i, "★" if e.get("important") else " ", e["owner"][:12], _trim(e["job"], 28), models,
+                i, prio_mark(e), e["owner"][:12], _trim(e["job"], 28), models,
                 timing, beat_age)
             if e.get("progress"):
                 line += " · " + e["progress"]
@@ -226,7 +226,7 @@ def _body_lines(view, color):
                 fmt_dur(now - (e["heartbeat"] or e["started"]))))
         else:
             out.append("%2d   waiting %s%-12s %-28s %s · %s" % (
-                i, "★" if e.get("important") else " ", e["owner"][:12], _trim(e["job"], 28), models, timing))
+                i, prio_mark(e), e["owner"][:12], _trim(e["job"], 28), models, timing))
         if e.get("why"):
             out.append(dim("       why: %s" % e["why"]))
     out.extend(warnings(view))
@@ -437,7 +437,7 @@ def tui_lines(views, sel_host, sel_row, now, width=80):
             if sel:
                 selected = (snap, e)
             prim = IND + "%2d %s%s %s" % (i + 1, "▶" if run else "⏏" if yld else " ",
-                                    "★" if e.get("important") else " ", e["owner"])
+                                    prio_mark(e), e["owner"])
             if e["job"]:
                 prim += "  —  " + e["job"]
             L.append((prim, "sel" if sel else "run" if run else "warn" if yld else "wait"))
@@ -448,7 +448,7 @@ def tui_lines(views, sel_host, sel_row, now, width=80):
                 det += " · " + e["progress"]
             L.append((det, "dim"))
             if sel:
-                bits = ["id %s" % e["id"], "joined %s" % fmt_clock(e["joined"], now)]
+                bits = ["id %s" % e["id"], "priority %d" % prio(e), "joined %s" % fmt_clock(e["joined"], now)]
                 if e.get("max_min"):
                     bits.append("max %s" % fmt_dur(e["max_min"] * 60))
                 L.append((DET + " · ".join(bits), "dim"))
@@ -1217,8 +1217,24 @@ def _forward(argv, host):
     return subprocess.call(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, cmd])
 
 
+def apply_rules(cfg):
+    """Config "rules" tune the line: {"jump_ratio": 10, "jump_max_hours": 6,
+    "priorities": {"chill": 5, "normal": 10, "important": 20, "ablaze": 30}}."""
+    from . import core
+    r = cfg.get("rules") or {}
+    if r.get("jump_ratio") is not None:
+        core.JUMP_RATIO = float(r["jump_ratio"])
+    if r.get("jump_max_hours") is not None:
+        core.JUMP_MAX_SEC = float(r["jump_max_hours"]) * 3600
+    for k, v in (r.get("priorities") or {}).items():
+        if k in core.PRIORITY:
+            core.PRIORITY[k] = int(v)
+    core.SHIELD = core.PRIORITY["important"]
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    apply_rules(config())
     ap = argparse.ArgumentParser(prog="gpuq", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", help="run the command against HOST's queue over ssh")
@@ -1235,6 +1251,17 @@ def main(argv=None):
     need.add_argument("--vram", type=float, metavar="GB", help="GPU memory the job needs, in GB")
     need.add_argument("--tag", action="append", default=None, metavar="TAG",
                       help="card tag the job needs (cuda, rocm, igpu, or your own); repeatable")
+    prio_p = argparse.ArgumentParser(add_help=False)  # where a job goes in line
+    g = prio_p.add_mutually_exclusive_group()
+    g.add_argument("--priority", metavar="LEVEL|N",
+                   help="%s, preempt (one above the running job), or any integer; higher goes first,"
+                        " and outranking the running job makes it yield"
+                        % ", ".join("%s (%d)" % kv for kv in PRIORITY.items()))
+    for lvl, n in PRIORITY.items():
+        g.add_argument("--" + lvl, dest="level", action="store_const", const=lvl,
+                       help="priority %d%s" % (n, " (never jumped by short jobs)" if n >= 20 else ""))
+    g.add_argument("--preempt", dest="level", action="store_const", const="preempt",
+                   help="one above the running job's priority: it yields, you go next")
     hosts_default = config().get("hosts") or HOST   # config "hosts": comma list; default = this host
     p = sub.add_parser("show", help="print the queue once", parents=[view])
     p.add_argument("--json", action="store_true")
@@ -1247,10 +1274,11 @@ def main(argv=None):
     p = sub.add_parser("tui", help="interactive view: select, reorder, remove")
     p.add_argument("--hosts", default=hosts_default, help="comma-separated (default: %s)" % hosts_default)
     p.add_argument("--every", type=float, default=5, help="seconds between refreshes")
-    p = sub.add_parser("join", help="get in line; prints your id", parents=[card, need, jsonp])
+    p = sub.add_parser("join", help="get in line; prints your id", parents=[card, need, prio_p, jsonp])
     p.add_argument("--spec", metavar="FILE",
                    help="read the job as a JSON object from FILE (- = stdin): owner, job, why, models,"
-                        " est, max, important, gpu, vram, tags; flags given as well win")
+                        " est, max, priority (or level: chill/normal/important/ablaze/preempt), gpu,"
+                        " vram, tags; flags given as well win")
     p.add_argument("--owner")
     p.add_argument("--job",
                    help="what the job is — be descriptive; the tui shows it in full, short views trim")
@@ -1259,18 +1287,15 @@ def main(argv=None):
     p.add_argument("--models", default="", help="comma-separated")
     p.add_argument("--est", type=int, help="expected minutes (default: the median of this job's past runs)")
     p.add_argument("--max", type=int, help="minutes after which the sweep purges you")
-    p.add_argument("--important", action="store_true", default=None,
-                   help="never jumped by short jobs (default: a job of hours goes ahead of one of days)")
     p.add_argument("--no-history", action="store_true", help="don't estimate from past runs")
     p = sub.add_parser("edit", help="change an entry's details; id and place are kept"
                        " (--gpu moves a waiting entry to the end of that card's line)",
-                       parents=[card, need, jsonp])
+                       parents=[card, need, prio_p, jsonp])
     p.add_argument("id")
     for f in ("--job", "--why", "--models"):
         p.add_argument(f)
     p.add_argument("--est", type=int)
     p.add_argument("--max", type=int)
-    p.add_argument("--important", action=argparse.BooleanOptionalAction, default=None)
     p = sub.add_parser("start", help="take the GPU (only as #1)", parents=[jsonp])
     p.add_argument("id")
     p.add_argument("--adopt", action="store_true",
@@ -1322,9 +1347,8 @@ def main(argv=None):
     p.add_argument("--hosts", default=hosts_default, help="comma-separated (default: %s)" % hosts_default)
     p.add_argument("--local", action="store_true", help="this host only")
     p = sub.add_parser("where", help="which card, on which host, can take a job — and how soon",
-                       parents=[need])
+                       parents=[need, prio_p])
     p.add_argument("--est", type=int, help="the job's minutes (applies the short-job jump to the wait)")
-    p.add_argument("--important", action="store_true")
     p.add_argument("--json", action="store_true")
     p.add_argument("--hosts", default=hosts_default, help="comma-separated (default: %s)" % hosts_default)
     p.add_argument("--local", action="store_true", help="this host only")
@@ -1459,7 +1483,8 @@ def _run(args, now):
                                          % (name, why, _need_flags(args)))
             elif args.vram or tags:
                 inv = _inv_local(Q, cfg, now)
-                rows = fleet.rank(inv, lines, now, args.vram, tags, est, bool(args.important), prefer)
+                rows = fleet.rank(inv, lines, now, args.vram, tags, est, prefer=prefer,
+                                  priority=want_priority(args, None))
                 if not rows or not rows[0][1]:
                     raise QueueError(2, "no card here fits (%s) — `gpuq where%s` looks on every host"
                                      % ("; ".join("%s: %s" % (r[0], r[2]) for r in rows) or "no cards",
@@ -1469,16 +1494,20 @@ def _run(args, now):
                 name = prefer or Q["default"]
             q = line_named(name)
             taken = {x["id"] for other in lines.values() for x in other}
+            before = {x["id"]: x["state"] for x in q}
+            pr = want_priority(args, q)
             e = join(q, now, args.owner, args.job, args.why or "", models, est, args.max,
-                     bool(args.important), taken=taken)
+                     taken=taken, priority=PRIORITY["normal"] if pr is None else pr)
             e["gpu"] = name
             if args.vram:
                 e["vram_gb"] = args.vram
             if tags:
                 e["tags"] = tags
-            log(now, "joined", e, "#%d%s" % (len(q), where(q)))
+            log(now, "joined", e, "#%d%s%s" % (q.index(e) + 1, where(q),
+                                               "" if prio(e) == PRIORITY["normal"] else ", priority %d" % prio(e)))
+            _note_yields(q, now, before)
             jumped = _jump(q, now, e)
-            res.update(id=e["id"], gpu=name, position=q.index(e) + 1, est_min=est,
+            res.update(id=e["id"], gpu=name, position=q.index(e) + 1, est_min=est, priority=prio(e),
                        est_from=est_from, jumped=jumped)
             if not as_json:
                 print(e["id"])
@@ -1521,8 +1550,9 @@ def _run(args, now):
                     e[key] = val
             if args.models is not None:
                 e["models"] = [m.strip() for m in args.models.split(",") if m.strip()]
-            if args.important is not None:
-                e["important"] = args.important
+            pr = want_priority(args, q, e)
+            if pr is not None:
+                e["priority"], e["important"] = pr, pr >= PRIORITY["important"]
             if args.vram is not None:
                 e["vram_gb"] = args.vram
             if args.tag is not None:
@@ -1537,10 +1567,14 @@ def _run(args, now):
                 e["gpu"], e["skips"] = args.gpu, 0
                 normalize(dest, now)
                 q = dest
+            if pr is not None or args.gpu:
+                before = {x["id"]: x["state"] for x in q}
+                place(q, now, e["id"])
+                _note_yields(q, now, before)
             log(now, "edited", e, where(q).strip())
-            if args.est is not None or args.important is not None or args.gpu:
+            if args.est is not None or pr is not None or args.gpu:
                 _jump(q, now, e)
-            res.update(id=e["id"], gpu=e.get("gpu"), position=q.index(e) + 1)
+            res.update(id=e["id"], gpu=e.get("gpu"), position=q.index(e) + 1, priority=prio(e))
         elif cmd == "beat":
             q = line_of(args.id, by_id=True)
             res["id"] = args.id
@@ -1703,9 +1737,13 @@ def _load_spec(args):
         if not isinstance(spec, dict):
             raise QueueError(2, "--spec: expected a JSON object")
         keys = {"owner": "owner", "job": "job", "why": "why", "models": "models", "est": "est",
-                "est_min": "est", "max": "max", "max_min": "max", "important": "important",
+                "est_min": "est", "max": "max", "max_min": "max", "priority": "priority", "level": "level",
                 "gpu": "gpu", "vram": "vram", "vram_gb": "vram", "tags": "tag", "tag": "tag"}
         for k, v in spec.items():
+            if k == "important":            # the old boolean
+                if v and not args.level and args.priority is None:
+                    args.level = "important"
+                continue
             if k not in keys:
                 raise QueueError(2, "--spec: unknown key %r (known: %s)" % (k, ", ".join(sorted(keys))))
             dest = keys[k]
@@ -1717,6 +1755,8 @@ def _load_spec(args):
                 setattr(args, dest, v)
     if not args.owner or not args.job:
         raise QueueError(2, "join needs --owner and --job (or a --spec with them)")
+    if args.level and args.level not in PRIORITY and args.level != "preempt":
+        raise QueueError(2, "--spec: level must be one of %s, preempt" % ", ".join(PRIORITY))
 
 
 def _need_flags(args):
@@ -1798,9 +1838,9 @@ def _inventory(args, now):
     return 0
 
 
-def where_rows(inv, lines, now, vram=None, tags=(), est=None, important=False):
+def where_rows(inv, lines, now, vram=None, tags=(), est=None, priority=None):
     rows = []
-    for n, ok, why, wait in fleet.rank(inv, lines, now, vram, tags, est, important):
+    for n, ok, why, wait in fleet.rank(inv, lines, now, vram, tags, est, priority=priority):
         c = inv[n]
         rows.append({"card": n, "fits": ok, "reason": why, "wait_sec": wait,
                      "usable_mib": c["usable_mib"], "tags": c["tags"], "in_line": c["in_line"]})
@@ -1814,12 +1854,13 @@ def _where(args, now):
             cfg = config()
             with store(write=False) as Q:
                 got = where_rows(_inv_local(Q, cfg, now), Q["lines"], now, args.vram,
-                                 args.tag or [], args.est, args.important)
+                                 args.tag or [], args.est, want_priority(args, None))
         else:
             extra = ([] if args.vram is None else ["--vram", "%g" % args.vram]) + \
                 [x for t in args.tag or [] for x in ("--tag", t)] + \
                 ([] if args.est is None else ["--est", str(args.est)]) + \
-                (["--important"] if args.important else [])
+                (["--priority", str(args.priority)] if args.priority is not None else []) + \
+                (["--" + args.level] if args.level else [])
             got, err = _remote_json(h, "where", "--json", "--local", *extra)
             if got is None:
                 rows.append({"host": h, "card": None, "fits": False, "reason": err, "wait_sec": None,
@@ -1890,6 +1931,27 @@ def _init(args, now):
     print("wrote %s — %d card(s): %s. Edit reserve_gb / vram_gb / tags / residents to taste; "
           "`gpuq inventory` shows the result." % (CONFIG, len(cards), ", ".join(cards) or "none found"))
     return 0
+
+
+def want_priority(args, q, e=None):
+    """The priority the flags ask for, or None when none was given. --preempt = one above the
+    running job of line Q (without a line, e.g. `where`: above anything)."""
+    lvl = getattr(args, "level", None)
+    val = getattr(args, "priority", None)
+    if val is not None:
+        val = str(val).strip().lower()
+        if val.lstrip("-").isdigit():
+            return int(val)
+        if val not in PRIORITY and val != "preempt":
+            raise QueueError(2, "--priority: %r is not a number or one of %s, preempt"
+                             % (val, ", ".join(PRIORITY)))
+        lvl = val
+    if lvl == "preempt":
+        if q is None:
+            return 10 ** 6
+        r = next((x for x in q if x["state"] in ("running", "yielding") and x is not e), None)
+        return max(prio(r) + 1, PRIORITY["normal"]) if r else PRIORITY["normal"]
+    return PRIORITY.get(lvl) if lvl else None
 
 
 def _note_yields(q, now, before):

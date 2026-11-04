@@ -61,7 +61,11 @@ TOOLS = [
          why={"type": "string"},
          models={"type": "array", "items": {"type": "string"}},
          max_min={"type": "integer", "description": "minutes after which you are purged"},
-         important={"type": "boolean", "description": "never jumped by shorter jobs"},
+         priority={"type": "integer", "description": "higher goes first; normal 10, chill 5, important 20,"
+                   " ablaze 30. Outranking the running job makes it yield"},
+         level={"type": "string", "enum": ["chill", "normal", "important", "ablaze", "preempt"],
+                "description": "a named priority; preempt = one above the running job's"},
+         important={"type": "boolean", "description": "same as level important"},
          gpu={"type": "string", "description": "a specific card by name (see gpuq_inventory)"})}},
     {"name": "gpuq_start",
      "description": "Try to take the GPU. state 'go': run now with env. 'wait': not your turn (or a yield was "
@@ -131,7 +135,7 @@ class Server:
                                       for i, e in enumerate(q)] for n, q in snap["lines"].items()}}
             return snap
         if name == "gpuq_join":
-            spec = {k: a[k] for k in ("owner", "job", "why", "models", "max_min", "important", "gpu",
+            spec = {k: a[k] for k in ("owner", "job", "why", "models", "max_min", "important", "gpu", "priority", "level",
                                       "vram_gb", "tags", "est_min") if a.get(k) not in (None, "", [])}
             args = ["join", "--json", "--owner", spec.pop("owner"), "--job", spec.pop("job")]
             for k, flag in (("why", "--why"), ("gpu", "--gpu"), ("max_min", "--max"), ("est_min", "--est"),
@@ -142,7 +146,11 @@ class Server:
                 args += ["--models", ",".join(spec["models"])]
             for t in spec.get("tags") or []:
                 args += ["--tag", t]
-            if spec.get("important"):
+            if "priority" in spec:
+                args += ["--priority", str(spec["priority"])]
+            elif spec.get("level"):
+                args.append("--" + spec["level"])
+            elif spec.get("important"):
                 args.append("--important")
             return _json_of(*self.run(args, host))
         if name in ("gpuq_start", "gpuq_beat", "gpuq_done"):

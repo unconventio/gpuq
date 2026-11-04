@@ -363,3 +363,52 @@ class Display(unittest.TestCase):
         self.assertIn("█████░░░░░", text)
         self.assertIn("idle", text)
         self.assertEqual(st, "m0")
+
+
+class Priority(unittest.TestCase):
+    def setUp(self):
+        from gpuq import core
+        self.c = core
+
+    def line(self, *jobs):
+        q = []
+        for owner, est, pr in jobs:
+            self.c.join(q, 0, owner, owner, est_min=est, priority=pr)
+        return q
+
+    def test_higher_goes_ahead_equals_keep_order(self):
+        q = self.line(("a", 600, 10), ("b", 600, 10), ("chill", 600, 5), ("imp", 600, 20), ("c", 600, 10))
+        self.assertEqual([e["owner"] for e in q], ["imp", "a", "b", "c", "chill"])
+
+    def test_outranking_the_runner_makes_it_yield(self):
+        q = self.line(("a", 600, 10))
+        self.c.start(q, 0, q[0]["id"])
+        self.c.join(q, 60, "ablaze", "u", est_min=600, priority=30)
+        self.assertEqual(q[0]["owner"], "ablaze")
+        self.assertEqual(q[1]["state"], "yielding")
+
+    def test_equal_priority_does_not_preempt(self):
+        q = self.line(("a", 600, 20))
+        self.c.start(q, 0, q[0]["id"])
+        self.c.join(q, 60, "b", "b", est_min=600, priority=20)
+        self.assertEqual([e["owner"] for e in q], ["a", "b"])
+        self.assertEqual(q[0]["state"], "running")
+
+    def test_short_job_cannot_jump_higher_priority(self):
+        q = self.line(("big", 6000, 15))
+        self.c.join(q, 0, "short", "s", est_min=5, priority=10)
+        self.c.jump(q, 0, q[-1]["id"])
+        self.assertEqual(q[0]["owner"], "big")
+
+    def test_old_entries_read_as_important_or_normal(self):
+        self.assertEqual(self.c.prio({"important": True}), 20)
+        self.assertEqual(self.c.prio({}), 10)
+        self.assertEqual(self.c.prio_mark({"priority": 5}), "☾")
+        self.assertEqual(self.c.prio_mark({"priority": 30}), "⚑")
+
+    def test_preempt_flag_is_one_above_runner(self):
+        from gpuq import cli
+        q = self.line(("a", 600, 20))
+        self.c.start(q, 0, q[0]["id"])
+        ns = type("A", (), {"priority": None, "level": "preempt"})()
+        self.assertEqual(cli.want_priority(ns, q), 21)

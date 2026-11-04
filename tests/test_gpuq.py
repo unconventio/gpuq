@@ -466,7 +466,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(self.run_cli("start", art).returncode, 3)
         self.run_cli("edit", art, "--est", "20")
         self.assertEqual(self.run_cli("beat", cap).returncode, 0)
-        self.run_cli("edit", cap, "--no-important")
+        self.run_cli("edit", cap, "--normal")
         self.run_cli("edit", art, "--est", "15")
         self.assertEqual(self.run_cli("beat", cap).returncode, 5)
 

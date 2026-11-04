@@ -8,9 +8,27 @@ import secrets
 STALE_SEC = 15 * 60        # a running holder silent this long is purged
 HEAD_GRACE_SEC = 15 * 60   # a waiting #1 must start within this long, or it is skipped
 # Short jobs go first: a job of at most JUMP_MAX_SEC goes ahead of any job with JUMP_RATIO
-# times as much left, unless that job is marked important.
+# times as much left, unless that job is important (priority SHIELD or more) or outranks it.
 JUMP_RATIO = 10
 JUMP_MAX_SEC = 6 * 3600
+
+# Priority: any integer, higher goes first. The named levels are the flags' defaults.
+PRIORITY = {"chill": 5, "normal": 10, "important": 20, "ablaze": 30}
+SHIELD = PRIORITY["important"]
+
+
+def prio(e):
+    """An entry's priority. Entries from before priorities: important = 20, else 10."""
+    p = e.get("priority")
+    if p is None:
+        return PRIORITY["important"] if e.get("important") else PRIORITY["normal"]
+    return p
+
+
+def prio_mark(e):
+    """One cell for the views: ⚑ ablaze, ★ important, ☾ chill, blank for normal."""
+    p = prio(e)
+    return "⚑" if p >= PRIORITY["ablaze"] else "★" if p >= SHIELD else "☾" if p < PRIORITY["normal"] else " "
 
 
 class QueueError(Exception):
@@ -54,7 +72,7 @@ def normalize(q, now):
 
 
 def join(q, now, owner, job, why="", models=(), est_min=None, max_min=None, important=False,
-         taken=()):
+         taken=(), priority=None):
     ids = {e["id"] for e in q} | set(taken)     # taken: ids in the other cards' lines
     eid = ""
     # Ids always carry a letter so they can never be mistaken for a position.
@@ -64,9 +82,26 @@ def join(q, now, owner, job, why="", models=(), est_min=None, max_min=None, impo
          "est_min": est_min, "max_min": max_min, "progress": "", "state": "waiting",
          "joined": now, "started": None, "heartbeat": None, "head_since": None, "skips": 0,
          "important": important}
+    if priority is not None:
+        e["priority"] = int(priority)
+        e["important"] = e["priority"] >= SHIELD
     q.append(e)
     normalize(q, now)
+    place(q, now, eid)
     return e
+
+
+def place(q, now, ref):
+    """Put an entry just behind the last other entry of at least its priority (first if none):
+    a higher priority goes ahead, equals keep their order. Passing the running job asks it to
+    yield. Hand-made order among the rest is left alone. Returns the new index."""
+    i = find(q, ref, by_id=True)
+    e, p = q[i], prio(q[i])
+    others = [x for x in q if x is not e]
+    j = max((k + 1 for k, x in enumerate(others) if prio(x) >= p), default=0)
+    if j != i:
+        move(q, now, e["id"], str(j + 1))
+    return j
 
 
 def remaining(e, now):
@@ -80,17 +115,17 @@ def remaining(e, now):
 
 def jump(q, now, ref):
     """Move a short job ahead of the long jobs directly in front of it; it stops at the
-    first job that is important, has no estimate, or isn't JUMP_RATIO times longer.
+    first job that is important, outranks it, has no estimate, or isn't JUMP_RATIO times longer.
     Passing the running job asks it to yield. Returns the entries passed."""
     i = find(q, ref, by_id=True)
-    mine = remaining(q[i], now)
+    mine, mp = remaining(q[i], now), prio(q[i])
     if mine is None or mine > JUMP_MAX_SEC:
         return []
     j = i
     while j > 0:
         x = q[j - 1]
         left = remaining(x, now)
-        if x.get("important") or left is None or left < JUMP_RATIO * max(mine, 60):
+        if prio(x) >= SHIELD or prio(x) > mp or left is None or left < JUMP_RATIO * max(mine, 60):
             break
         j -= 1
     passed = q[j:i]

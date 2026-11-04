@@ -77,12 +77,12 @@ def card_tags(name, c, cfg):
     return sorted(tags)
 
 
-def line_wait(q, now, est_min=None, important=False):
+def line_wait(q, now, est_min=None, important=False, priority=None):
     """Seconds until a job joining line Q now could start, or None when an estimate in the way is
     missing. With est_min, the short-job-first jump is applied, as `join` would."""
     q = [dict(e) for e in q]
     probe = join(q, now, "?", "?", est_min=est_min, important=important,
-                 taken={e["id"] for e in q})
+                 taken={e["id"] for e in q}, priority=priority)
     if est_min:
         jump(q, now, probe["id"])
     wait = 0
@@ -161,14 +161,15 @@ def fits(card, vram_gb=None, tags=()):
     return True, ""
 
 
-def rank(inv, lines, now, vram_gb=None, tags=(), est_min=None, important=False, prefer=None):
+def rank(inv, lines, now, vram_gb=None, tags=(), est_min=None, important=False, prefer=None,
+         priority=None):
     """[(name, ok, reason, wait_sec)] best first: fitting cards, then the shortest wait (with the
     short-job jump applied), then the preferred card, then the smallest card that fits (keep the
     big one free)."""
     rows = []
     for n, c in inv.items():
         ok, why = fits(c, vram_gb, tags)
-        wait = line_wait(lines.get(n) or [], now, est_min, important)
+        wait = line_wait(lines.get(n) or [], now, est_min, important, priority)
         rows.append((n, ok, why, wait))
     big = float("inf")
     rows.sort(key=lambda r: (not r[1], big if r[3] is None else r[3], r[0] != prefer,
