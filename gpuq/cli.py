@@ -577,7 +577,9 @@ def screen_summary(views, hosts, now, width, focus):
         waiting = len(q) - (1 if r else 0)
         rows.append(dict(
             name=c.get("model") or card or host, host=host,
-            now=("%s%s  %s" % (r["owner"], " (yielding)" if r["state"] == "yielding" else "", r["job"]) if r
+            # the runner's priority mark (⚑ ★ ☾) says what a new job would have to beat
+            now=("%s%s%s  %s" % ("" if prio_mark(r) == " " else prio_mark(r) + " ", r["owner"],
+                                 " (yielding)" if r["state"] == "yielding" else "", r["job"]) if r
                  else "idle" if not q else "free, %d waiting" % waiting),
             frees=frees_at(snap, now), next="+%d" % waiting if r and waiting else "-",
             used=m.get("used_mib"), gib=c.get("mib"), shared=bool(c.get("integrated")),
