@@ -556,6 +556,14 @@ def fleet_alerts(views, now):
         for w in warnings(snap):
             if w.startswith("⚠"):
                 out.append((vi, "%s: %s" % (name, w.lstrip("⚠ "))))
+        for n in snap.get("notices") or []:
+            if snap.get("card") and n.get("gpu") not in (None, snap.get("card")):
+                continue
+            if any(o[1].endswith("[%s]" % n["id"]) for o in out):
+                continue            # one line per job, its latest notice (they are oldest first)
+            out.append((vi, "%s: %s %s %s — %s (%s ago) [%s]" % (
+                name, n.get("owner"), n.get("job", "")[:40], n["kind"], n.get("text", ""),
+                fmt_dur(now - n["t"]), n["id"])))
     return out
 
 
@@ -900,10 +908,178 @@ def write_freed(units):
 QUEUE = {"id": "-", "owner": "queue", "job": ""}   # history subject for queue-wide events
 
 
-def log(now, event, e, note=""):
+def log(now, event, e, note="", **extra):
+    rec = {"t": now, "event": event, "id": e["id"], "owner": e["owner"], "job": e["job"], "note": note}
+    rec.update({k: v for k, v in extra.items() if v is not None})
     with open(STATE / "history.jsonl", "a") as f:
-        f.write(json.dumps({"t": now, "event": event, "id": e["id"], "owner": e["owner"],
-                            "job": e["job"], "note": note}) + "\n")
+        f.write(json.dumps(rec) + "\n")
+
+
+# ---- notices: telling a job's contact that it died, was purged, or stalled ----
+# A notice is one JSON line in STATE/inbox/<contact>.jsonl on the host where the job ran.
+# Readers pull: `gpuq inbox`, the MCP server (on every tool call), the TUI (red ⚠ lines).
+# Each reader keeps its own "seen up to" mark (inbox/.seen-<reader>), so a human dismissing
+# a notice on screen doesn't take it from the agent it was meant for.
+# Delivery beyond the file, from the config "notify" block:
+#   desktop  "never" (default) | "always": a desktop notice for every notice, not only the jobs
+#            that asked for one with `join --desktop`
+#   ntfy     a URL (your own ntfy topic): desktop-bound notices are POSTed there too
+#   command  a shell command run for every notice, with {id} {kind} {owner} {job} {exit} {log}
+#            {contact} {text} filled in (shell-quoted)
+NOTICE_KEEP_SEC = 24 * 3600     # notices older than this aren't shown as unread
+_OUTBOX = []                     # desktop/ntfy/command deliveries, sent after the queue lock is released
+
+
+def _inbox():
+    d = STATE / "inbox"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _contacts(e):
+    c = e.get("contact")
+    if isinstance(c, str):
+        c = [x.strip() for x in c.split(",")]
+    return [x for x in (c or [e.get("owner")]) if x] or ["unknown"]
+
+
+def _safe_name(s):
+    return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in s)[:64] or "_"
+
+
+def notify(now, e, kind, text, **extra):
+    """Write a notice for each of E's contacts, and queue the desktop/ntfy/command deliveries."""
+    n = {"t": now, "host": HOST, "gpu": e.get("gpu"), "id": e["id"], "owner": e.get("owner"),
+         "job": e.get("job"), "kind": kind, "text": text, "log": e.get("log")}
+    n.update({k: v for k, v in extra.items() if v is not None})
+    for c in _contacts(e):
+        with open(_inbox() / (_safe_name(c) + ".jsonl"), "a") as f:
+            f.write(json.dumps(dict(n, contact=c)) + "\n")
+    _OUTBOX.append((n, bool(e.get("desktop")), _contacts(e)))
+    return n
+
+
+def _desktop_env():
+    env = dict(os.environ)
+    if not env.get("DBUS_SESSION_BUS_ADDRESS"):         # e.g. a wrapper started in tmux or by a timer
+        run = env.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+        env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=%s/bus" % run
+    return env
+
+
+def flush_outbox():
+    """Send what notify() queued. Best effort: a failed delivery never fails the command."""
+    cfg = (config().get("notify") or {})
+    while _OUTBOX:
+        n, desktop, contacts = _OUTBOX.pop(0)
+        title = "gpuq: %s %s" % (n["owner"], n["kind"])
+        body = "%s (%s) on %s@%s: %s%s" % (n["job"], n["id"], n.get("gpu") or "?", n["host"], n["text"],
+                                           "\nlog: %s" % n["log"] if n.get("log") else "")
+        if (desktop or cfg.get("desktop") == "always") and os.environ.get("GPUQ_DESKTOP") != "0":
+            if shutil.which("notify-send"):
+                try:
+                    subprocess.run(["notify-send", "-u", "critical", "-a", "gpuq", title, body],
+                                   env=_desktop_env(), timeout=10, capture_output=True)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            if cfg.get("ntfy"):
+                try:
+                    import urllib.request
+                    urllib.request.urlopen(urllib.request.Request(
+                        cfg["ntfy"], data=body.encode(), headers={"Title": title, "Priority": "high"}),
+                        timeout=10).read()
+                except Exception:   # noqa: BLE001 (any network failure: the inbox still has it)
+                    pass
+        if cfg.get("command"):
+            fill = {k: shlex.quote(str(n.get(k) if n.get(k) is not None else ""))
+                    for k in ("id", "kind", "owner", "job", "exit", "log", "text")}
+            fill["contact"] = shlex.quote(",".join(contacts))
+            try:
+                subprocess.run(cfg["command"].format(**fill), shell=True, timeout=30)
+            except (OSError, subprocess.TimeoutExpired, KeyError, IndexError, ValueError):
+                pass
+
+
+def _seen_path(reader):
+    return _inbox() / (".seen-" + _safe_name(reader))
+
+
+def notices(now, contact=None, reader=None, unread=True):
+    """Notices on this host, oldest first: CONTACT's (else everyone's). With UNREAD, only those
+    newer than READER's seen mark (READER defaults to the contact, else "screen") and younger
+    than NOTICE_KEEP_SEC."""
+    reader = reader or contact or "screen"
+    try:
+        seen = float(_seen_path(reader).read_text().strip() or 0)
+    except (OSError, ValueError):
+        seen = 0
+    out = []
+    files = [_inbox() / (_safe_name(contact) + ".jsonl")] if contact else sorted(_inbox().glob("*.jsonl"))
+    for f in files:
+        try:
+            lines = f.read_text().splitlines()
+        except OSError:
+            continue
+        for l in lines:
+            try:
+                n = json.loads(l)
+            except ValueError:
+                continue
+            if unread and (n.get("t", 0) <= seen or now - n.get("t", 0) > NOTICE_KEEP_SEC):
+                continue
+            out.append(n)
+    out.sort(key=lambda n: n.get("t", 0))
+    return out
+
+
+def mark_seen(reader, upto):
+    _seen_path(reader).write_text("%r" % upto)
+
+
+def _peak_text(e):
+    """'peak 18.2 GB, load 87%' from the beats' samples, or ''."""
+    bits = []
+    if e.get("mem_peak_mib") is not None:
+        bits.append("card memory peak %s" % fleet.gb(e["mem_peak_mib"]))
+    if e.get("util_n"):
+        bits.append("load %d%%" % round(e["util_sum"] / e["util_n"]))
+    return ", ".join(bits)
+
+
+def _exit_text(code):
+    if code is None:
+        return "no exit code given"
+    if code < 0:
+        try:
+            name = signal.Signals(-code).name
+        except ValueError:
+            name = "signal %d" % -code
+        return "killed by %s%s" % (name, " (out of memory?)" if code == -9 else "")
+    return "exit %d" % code
+
+
+def finish(now, e, code=None, quiet=False):
+    """Log a job leaving the line through `done`, and tell its contact if it ended badly."""
+    end = ending(e, now, code)
+    ran = end["ran_sec"]
+    bits = [] if code is None else [_exit_text(code)]
+    if ran is not None:
+        bits.append("after %s" % fmt_dur(ran))
+    if _peak_text(e):
+        bits.append(_peak_text(e))
+    note = ", ".join(bits)
+    kind = None if quiet else end["kind"]
+    if kind:
+        note += " ⚠ died early" if end["early"] else ""
+    log(now, "failed" if kind == "failed" else "done", e, note, exit=code, ran_sec=ran, early=end["early"] or None,
+        log=e.get("log"), mem_peak_mib=e.get("mem_peak_mib"), mem_start_mib=e.get("mem_start_mib"),
+        util_avg=round(e["util_sum"] / e["util_n"]) if e.get("util_n") else None)
+    if kind:
+        text = _exit_text(code)
+        if ran is not None:
+            text += " after %s" % fmt_dur(ran)
+        notify(now, e, "died early" if end["early"] else kind, text, exit=code, ran_sec=ran)
+    return end
 
 
 def history(n=5):
@@ -1282,6 +1458,7 @@ def local_snapshot(now):
         snap = snapshot(lines[Q["default"]], now, history(), loaded, paused=paused_state(),
                         lines=lines, cards=cards, card_use=use, default=Q["default"], evac=read_evac())
         snap["meters"] = card_meters(cards)
+        snap["notices"] = notices(now)      # unread by the screen: the TUI shows them as alerts
         if use and len(use) == 1:       # one card: per_card() leaves the snapshot alone, so carry busy here
             snap["busy"] = next(iter(use.values())).get("busy")
         return snap
@@ -1339,7 +1516,7 @@ def fetch_views(hosts):
     return views
 
 
-TUI_KEYS = " ↑↓ job  ←→ GPU  k/j move  d remove  p hold  ? help  q quit "
+TUI_KEYS = " ↑↓ job  ←→ GPU  k/j move  d remove  p hold  a dismiss  ? help  q quit "
 TUI_HELP = """GPU Queue — help                                         any key closes
 
 KEYS
@@ -1351,6 +1528,8 @@ KEYS
   d            remove the selected job from the line (its process is not killed)
   p            hold / release the machine's line: while held nobody may start,
                on any of that machine's GPUs. Running jobs keep running.
+  a            dismiss the notices on this machine (jobs that died, were purged or
+               stalled) from the screen; the job's contact still gets them
   r            refresh now (it refreshes every few seconds anyway)
   q / Esc      quit; jobs are not affected
 
@@ -1360,8 +1539,9 @@ SUMMARY
                estimate, end unknown), ? (no estimate)
   NEXT         how many jobs wait behind it
   MEM / UTIL   memory in use / total (sh = an iGPU's shared system memory) and load
-  ⚠            something needs you, on any GPU: a job past its estimate, one that
-               won't yield, GPU use outside the queue, a held line, a lost machine
+  ⚠            something needs you, on any GPU: a job that died, was purged or stalled,
+               one past its estimate, one that won't yield, GPU use outside the queue,
+               a held line, a lost machine
 
 MARKS
   ▶ running   ⏏ yielding   ⚑ ablaze (30)   ★ important (20)   ☾ chill (5)
@@ -1512,6 +1692,13 @@ def _tui(args):
                 scr.timeout(250)
             elif k == ord("r"):
                 fetched = 0
+            elif k == ord("a") and views[sh][1]:
+                if views[sh][1].get("notices"):
+                    code, out = act(host, "inbox", "--ack", "--reader", "screen", "--hosts", host)
+                    msg = " %s: notices dismissed from the screen " % host
+                else:
+                    msg = " no notices on %s " % host
+                fetched = 0
             elif k == ord("p") and views[sh][1]:
                 verb = "resume" if views[sh][1].get("paused") else "pause"
                 code, out = act(host, verb)
@@ -1563,7 +1750,8 @@ def _forward(argv, host):
 
 def apply_rules(cfg):
     """Config "rules" tune the line: {"jump_ratio": 10, "jump_max_hours": 6,
-    "priorities": {"chill": 5, "normal": 10, "important": 20, "ablaze": 30}}."""
+    "priorities": {"chill": 5, "normal": 10, "important": 20, "ablaze": 30},
+    "early_death_min": 10, "stall_min": 30}."""
     from . import core
     r = cfg.get("rules") or {}
     if r.get("jump_ratio") is not None:
@@ -1574,6 +1762,10 @@ def apply_rules(cfg):
         if k in core.PRIORITY:
             core.PRIORITY[k] = int(v)
     core.SHIELD = core.PRIORITY["important"]
+    if r.get("early_death_min") is not None:
+        core.EARLY_SEC = float(r["early_death_min"]) * 60
+    if r.get("stall_min") is not None:
+        core.STALL_SEC = float(r["stall_min"]) * 60
 
 
 def main(argv=None):
@@ -1632,6 +1824,12 @@ def main(argv=None):
     p.add_argument("--est", type=int, help="expected minutes (default: the median of this job's past runs)")
     p.add_argument("--max", type=int, help="minutes after which the sweep purges you")
     p.add_argument("--no-history", action="store_true", help="don't estimate from past runs")
+    p.add_argument("--contact", metavar="NAME[,NAME]",
+                   help="who is told if the job dies, is purged or stalls (default: the owner);"
+                        " read with `gpuq inbox`")
+    p.add_argument("--desktop", action="store_true",
+                   help="also pop a desktop notice (and ntfy, if configured) when that happens")
+    p.add_argument("--log", metavar="PATH", help="the job's log file, quoted in notices")
     p = sub.add_parser("edit", help="change an entry's details; id and place are kept"
                        " (--gpu moves a waiting entry to the end of that card's line)",
                        parents=[card, need, prio_p, jsonp])
@@ -1642,21 +1840,30 @@ def main(argv=None):
     p.add_argument("--max", type=int)
     p = sub.add_parser("start", help="take the GPU (only as #1)", parents=[jsonp])
     p.add_argument("id")
+    p.add_argument("--log", metavar="PATH", help="record the job's log file (gpuq run does)")
     p.add_argument("--adopt", action="store_true",
                    help="take over a lock file written outside gpuq (backfilling a live job)")
-    p = sub.add_parser("beat", help="heartbeat; at least every 15 min (exit 5 = yield: stop, poll start)",
+    p = sub.add_parser("beat", help="heartbeat, about every minute; silent 15 min = purged"
+                       " (exit 4 = purged: stop; 5 = yield: stop, poll start)",
                        parents=[jsonp])
     p.add_argument("id")
     p.add_argument("--progress")
+    p.add_argument("--mem", type=float, metavar="GB", help="the card's memory in use now, in GB (gpuq run samples it)")
+    p.add_argument("--util", type=int, metavar="PCT", help="the card's load now, in percent")
     p = sub.add_parser("done", help="release the GPU and leave the line", parents=[jsonp])
     p.add_argument("id")
+    p.add_argument("--exit", type=int, metavar="CODE",
+                   help="the job's exit code (negative: killed by that signal); non-zero tells its contact")
+    p.add_argument("--no-notice", "--quiet", dest="quiet", action="store_true",
+                   help="tell nobody, however it ended (a deliberate stop)")
     p = sub.add_parser("env", help="print the job's card as CUDA_VISIBLE_DEVICES=GPU-<uuid>", parents=[jsonp])
     p.add_argument("id")
     p = sub.add_parser("mv", help="move an entry (position or id) to a position", parents=[card, jsonp])
     p.add_argument("src")
     p.add_argument("dst")
     p = sub.add_parser("run", help="hold the GPU for CMD: start, beat, stop on yield, rerun at #1, done",
-                       usage="gpuq run ID [--every S] [--grace S] [--on-stop SHELL] [--progress-file F] -- CMD ...",
+                       usage="gpuq run ID [--every S] [--grace S] [--on-stop SHELL] [--progress-file F] [--free]"
+                             " [--log PATH|-] -- CMD ...",
                        description="Runs CMD in its own process group once ID may start, beats every"
                        " --every seconds, stops it on a yield (beat exit 5) and reruns it from the"
                        " start when ID is #1 again — so CMD must be safe to rerun. Calls done when"
@@ -1668,6 +1875,8 @@ def main(argv=None):
     p.add_argument("--progress-file", help="its last line is sent as --progress with each beat")
     p.add_argument("--free", action="store_true",
                    help="free the card's residents (`gpuq free`) once granted; restart what it stopped at the end")
+    p.add_argument("--log", metavar="PATH",
+                   help="where CMD's output is saved as well (default: STATE/logs/ID.log; - = don't save)")
     p = sub.add_parser("yield", help="ask the running job to step back (default to #2)", parents=[jsonp])
     p.add_argument("id")
     p.add_argument("to", nargs="?")
@@ -1700,6 +1909,14 @@ def main(argv=None):
     p.add_argument("--print", action="store_true", help="print it; write nothing")
     p.add_argument("--force", action="store_true", help="replace an existing config (kept as .bak)")
     sub.add_parser("mcp", help="serve the queue to AI agents over MCP (stdio)")
+    p = sub.add_parser("inbox", help="notices: jobs that died, were purged or stalled")
+    p.add_argument("--contact", help="only this contact's notices (default: everyone's)")
+    p.add_argument("--reader", help=argparse.SUPPRESS)   # whose "read" mark: default the contact, else "screen"
+    p.add_argument("--all", action="store_true", help="every notice kept, read or not")
+    p.add_argument("--ack", action="store_true", help="mark what is shown as seen")
+    p.add_argument("--follow", action="store_true", help="keep printing new notices as they come (for Monitor)")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--hosts", default=hosts_default, help="comma-separated (default: %s)" % hosts_default)
     # everything after the first "--" is gpuq run's command, never gpuq's own options
     head, run_cmd = (argv[:argv.index("--")], argv[argv.index("--") + 1:]) if "--" in argv else (argv, [])
     args = ap.parse_args(head)
@@ -1712,7 +1929,10 @@ def main(argv=None):
     as_json = getattr(args, "json", False) and args.cmd in ACTION_JSON
     args.result = {}
     try:
-        rc = _run(args, now)
+        try:
+            rc = _run(args, now)
+        finally:
+            flush_outbox()
     except QueueError as err:
         if as_json:
             print(json.dumps({"ok": False, "code": err.code, "state": state_name(args.cmd, err.code),
@@ -1787,6 +2007,8 @@ def _run(args, now):
     if cmd == "mcp":
         from .mcp import serve
         return serve()
+    if cmd == "inbox":
+        return _inbox_cmd(args, now)
     res = getattr(args, "result", {})
     as_json = getattr(args, "json", False)
     if cmd == "join":
@@ -1854,6 +2076,12 @@ def _run(args, now):
                 e["vram_gb"] = args.vram
             if tags:
                 e["tags"] = tags
+            if args.contact:
+                e["contact"] = [c.strip() for c in args.contact.split(",") if c.strip()]
+            if args.desktop:
+                e["desktop"] = True
+            if args.log:
+                e["log"] = os.path.abspath(os.path.expanduser(args.log))
             log(now, "joined", e, "#%d%s%s" % (q.index(e) + 1, where(q),
                                                "" if prio(e) == PRIORITY["normal"] else ", priority %d" % prio(e)))
             _note_yields(q, now, before)
@@ -1879,6 +2107,8 @@ def _run(args, now):
                     log(now, "yielded", e, "now #%d" % (q.index(e) + 1))
                 raise
             write_compat(e)
+            if args.log:
+                e["log"] = os.path.abspath(os.path.expanduser(args.log))
             if was != "running":
                 log(now, "started", e, "adopted a live job" if args.adopt else where(q).strip())
             pin = card_env(Q, args.id)
@@ -1929,13 +2159,14 @@ def _run(args, now):
         elif cmd == "beat":
             q = line_of(args.id, by_id=True)
             res["id"] = args.id
-            e = beat(q, now, args.id, args.progress)
+            e = beat(q, now, args.id, args.progress, None if args.mem is None else int(args.mem * 1024), args.util)
             res["position"] = q.index(e) + 1
         elif cmd == "done":
             e = done(line_of(args.id, by_id=True), now, args.id)
             clear_compat(e["id"])
-            log(now, "done", e)
-            res["id"] = e["id"]
+            end = finish(now, e, args.exit, args.quiet)
+            res.update(id=e["id"], exit=args.exit, ran_sec=end["ran_sec"],
+                       notice=None if args.quiet else end["kind"], early=end["early"])
         elif cmd in ("mv", "yield"):
             if cmd == "yield":
                 q = line_of(args.id, by_id=True)
@@ -1968,7 +2199,71 @@ def _run(args, now):
                     clear_compat(e["id"])
                     log(now, event, e, note)
                     print("%s %s (%s): %s" % (event, e["owner"], e["id"], note))
+                    if event == "purged":
+                        end = ending(e, now)
+                        notify(now, e, "purged", "%s%s" % ("died early? " if end["early"] else "", note),
+                               ran_sec=end["ran_sec"])
+                for e, why in stalls(q, now):
+                    log(now, "stalled", e, why)
+                    notify(now, e, "stalled", why)
+                    print("stalled %s (%s): %s" % (e["owner"], e["id"], why))
     return 0
+
+
+def fmt_notice(n, now):
+    where = "%s@%s" % (n.get("gpu") or "?", n.get("host") or "?")
+    return "%s ⚠ %s %s: %s (%s) on %s — %s%s" % (
+        fmt_clock(n["t"], now), n.get("contact") or n.get("owner"), n["kind"], n.get("job") or "",
+        n["id"], where, n.get("text") or "", "  log: %s" % n["log"] if n.get("log") else "")
+
+
+def _inbox_cmd(args, now):
+    """gpuq inbox: list (and --ack) notices here or on --hosts; --follow keeps printing."""
+    hosts = [h.strip() for h in (args.hosts or HOST).split(",") if h.strip()]
+    base = ["inbox", "--json"] + (["--contact", args.contact] if args.contact else []) + \
+           (["--reader", args.reader] if args.reader else []) + (["--all"] if args.all else []) + \
+           (["--ack"] if args.ack else [])
+
+    def gather():
+        out, errs = [], []
+        for h in hosts:
+            if h == HOST:
+                got = notices(now if not args.follow else time.time(), args.contact, args.reader,
+                              unread=not args.all)
+                if args.ack and got:
+                    mark_seen(args.reader or args.contact or "screen", max(n["t"] for n in got))
+            else:
+                got, err = _remote_json(h, *base)
+                if err:
+                    errs.append(err)
+                    continue
+            out.extend(got or [])
+        return sorted(out, key=lambda n: n.get("t", 0)), errs
+
+    if args.follow:
+        shown = set()
+        try:
+            while True:
+                got, _ = gather()
+                for n in got:
+                    key = (n.get("host"), n["id"], n["kind"], n["t"], n.get("contact"))
+                    if key not in shown:
+                        shown.add(key)
+                        print(json.dumps(n) if args.json else fmt_notice(n, time.time()), flush=True)
+                time.sleep(10)
+        except KeyboardInterrupt:
+            return 0
+    got, errs = gather()
+    if args.json:
+        print(json.dumps(got))
+    else:
+        for n in got:
+            print(fmt_notice(n, now))
+        if not got:
+            print("no %snotices" % ("" if args.all else "unread "))
+    for e in errs:
+        print("gpuq: %s" % e, file=sys.stderr)
+    return 1 if errs and not got else 0
 
 
 def card_env(Q, eid):
@@ -2016,6 +2311,77 @@ def _hold(args):
 
     proc = None
     freed = []      # units this run stopped with --free: started again when it ends
+    if args.log == "-":
+        log_path = None
+    else:
+        log_path = Path(os.path.expanduser(args.log)) if args.log else STATE / "logs" / ("%s.log" % args.id)
+        log_path = log_path.absolute()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    tee = None      # the thread copying CMD's terminal output to ours and to the log
+
+    def launch(env):
+        """Start CMD in its own session. With a log, on a pty (so it keeps line-buffering and
+        progress bars, as on a terminal) whose output a thread copies to our stdout and the log."""
+        nonlocal tee
+        if log_path is None:
+            return subprocess.Popen(cmd, start_new_session=True, env=env)
+        import pty
+        import threading
+        master, slave = pty.openpty()
+        try:
+            import fcntl as _f
+            import termios
+            if sys.stdout.isatty():
+                _f.ioctl(slave, termios.TIOCSWINSZ, _f.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8))
+        except (OSError, ImportError):
+            pass
+        logf = open(log_path, "ab")
+        logf.write(("\n== gpuq run %s: started %s: %s ==\n"
+                    % (args.id, time.strftime("%Y-%m-%d %H:%M:%S"), shlex.join(cmd))).encode())
+        logf.flush()
+        p = subprocess.Popen(cmd, start_new_session=True, env=env, stdin=subprocess.DEVNULL
+                             if not sys.stdin.isatty() else None, stdout=slave, stderr=slave)
+        os.close(slave)
+        out = sys.stdout.buffer
+
+        def copy():
+            try:
+                while True:
+                    try:
+                        data = os.read(master, 65536)
+                    except OSError:     # EIO: every writer has closed the pty
+                        break
+                    if not data:
+                        break
+                    logf.write(data)
+                    logf.flush()
+                    try:
+                        out.write(data)
+                        out.flush()
+                    except (OSError, ValueError):
+                        pass
+            finally:
+                os.close(master)
+                logf.close()
+        tee = threading.Thread(target=copy, daemon=True)
+        tee.start()
+        return p
+
+    def drain():
+        if tee is not None:
+            tee.join(timeout=10)
+
+    def sample(card, cards):
+        """--mem/--util for a beat: the card's memory in use and load, if they can be read."""
+        if not card or card not in cards:
+            return []
+        m = card_meters({card: cards[card]}).get(card) or {}
+        out = []
+        if m.get("used_mib") is not None:
+            out += ["--mem", "%.2f" % (m["used_mib"] / 1024)]
+        if m.get("util") is not None:
+            out += ["--util", str(m["util"])]
+        return out
 
     def unfree():
         if freed:
@@ -2030,7 +2396,8 @@ def _hold(args):
     signal.signal(signal.SIGTERM, on_signal)
     try:
         while True:
-            while (rc := gq("start", args.id)) == 3:     # 3 also acknowledges a yield
+            start_args = ["start", args.id] + (["--log", str(log_path)] if log_path else [])
+            while (rc := gq(*start_args)) == 3:     # 3 also acknowledges a yield
                 time.sleep(args.every)
             if rc != 0:
                 say("start exited %d — not running" % rc)
@@ -2039,13 +2406,14 @@ def _hold(args):
             with store(write=False) as Q:
                 pin = card_env(Q, args.id) if len(Q["lines"]) > 1 else None
                 mine = next((n for n, q in Q["lines"].items() if any(e["id"] == args.id for e in q)), None)
+                cards = dict(Q["cards"])
             if args.free and mine:
                 _, stopped = free_card(mine, config(), say=lambda t: say(t.strip()))
                 freed.extend(u for u in stopped if u not in freed)
             if pin:
                 env[pin.partition("=")[0]] = pin.partition("=")[2]
             say("granted%s, running: %s" % (" (%s)" % pin if pin else "", shlex.join(cmd)))
-            proc = subprocess.Popen(cmd, start_new_session=True, env=env)
+            proc = launch(env)
             while True:
                 try:
                     proc.wait(timeout=args.every)
@@ -2053,16 +2421,19 @@ def _hold(args):
                 except subprocess.TimeoutExpired:
                     pass
                 p = progress()
-                rc = gq("beat", args.id, *(["--progress", p] if p else []))
+                rc = gq("beat", args.id, *(["--progress", p] if p else []), *sample(mine, cards))
                 if rc in (4, 5):
                     break
             if proc.returncode is not None:
                 code, proc = proc.returncode, None
-                gq("done", args.id)
-                say("finished (exit %d), released the GPU" % code)
+                drain()
+                gq("done", args.id, "--exit=%d" % code)
+                say("finished (%s), released the GPU%s" % (_exit_text(code),
+                                                           "; log: %s" % log_path if log_path else ""))
                 unfree()
-                return code
+                return code if code >= 0 else 128 - code
             stop(proc)
+            drain()
             proc = None
             if rc == 4:
                 say("purged from the queue — stopped")
@@ -2072,7 +2443,8 @@ def _hold(args):
     except KeyboardInterrupt:
         if proc is not None and proc.poll() is None:
             stop(proc)
-        gq("done", args.id)
+        drain()
+        gq("done", args.id, "--no-notice")
         say("interrupted — stopped and left the line")
         unfree()
         return 130

@@ -185,11 +185,11 @@ def run_seconds(records):
         eid, ev = h.get("id"), h.get("event")
         if ev == "started":
             open_at[eid] = h["t"]
-        elif ev in ("yielded", "done", "purged", "removed") and eid in open_at:
+        elif ev in ("yielded", "done", "purged", "removed", "failed") and eid in open_at:
             total[eid] = total.get(eid, 0) + h["t"] - open_at.pop(eid)
         if ev == "done" and eid in total:
             out[eid] = (h.get("job") or "", h.get("owner") or "", total.pop(eid))
-        elif ev in ("purged", "removed"):
+        elif ev in ("purged", "removed", "failed"):
             total.pop(eid, None)
     return out
 

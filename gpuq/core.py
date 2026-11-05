@@ -12,6 +12,12 @@ HEAD_GRACE_SEC = 15 * 60   # a waiting #1 must start within this long, or it is 
 JUMP_RATIO = 10
 JUMP_MAX_SEC = 6 * 3600
 
+# Notices: a job that ends badly within EARLY_SEC of getting the card is an "early death";
+# a running job whose --progress hasn't changed, or whose card sat at 0% load, for STALL_SEC
+# is "stalled" (told once, until it moves again).
+EARLY_SEC = 10 * 60
+STALL_SEC = 30 * 60
+
 # Priority: any integer, higher goes first. The named levels are the flags' defaults.
 PRIORITY = {"chill": 5, "normal": 10, "important": 20, "ablaze": 30}
 SHIELD = PRIORITY["important"]
@@ -150,20 +156,71 @@ def start(q, now, eid):
                          % (y["owner"], y["id"]))
     if i != 0:
         raise QueueError(3, "%s is #%d, not #1 — wait your turn" % (eid, i + 1))
-    e.update(state="running", started=now, heartbeat=now, skips=0)
+    e.update(state="running", started=now, heartbeat=now, skips=0, progress_since=now,
+             idle_since=None, stalled=None)
     normalize(q, now)
     return e
 
 
-def beat(q, now, eid, progress=None):
+def beat(q, now, eid, progress=None, mem_mib=None, util=None):
+    """A heartbeat. PROGRESS is the job's own word for how far it is; MEM_MIB and UTIL are the
+    card's memory in use and load, sampled by the holder (`gpuq run` does), kept as running
+    figures: memory at the first sample and the peak, average load, and since when it is idle."""
     e = q[find(q, eid, by_id=True)]
     e["heartbeat"] = now
     if progress is not None:
+        if progress != e.get("progress"):
+            e["progress_since"] = now
+            if e.get("stalled") == "progress":
+                e["stalled"] = None
         e["progress"] = progress
+    if mem_mib is not None:
+        e.setdefault("mem_start_mib", mem_mib)
+        e["mem_peak_mib"] = max(e.get("mem_peak_mib") or 0, mem_mib)
+    if util is not None:
+        e["util_sum"] = (e.get("util_sum") or 0) + util
+        e["util_n"] = (e.get("util_n") or 0) + 1
+        if util > 0:
+            e["idle_since"] = None
+            if e.get("stalled") == "idle":
+                e["stalled"] = None
+        elif not e.get("idle_since"):
+            e["idle_since"] = now
     if e["state"] == "yielding":
         raise QueueError(5, "yield: stop your GPU work, then poll `gpuq start %s` until it is"
                          " your turn again" % eid, save=True)
     return e
+
+
+def stalls(q, now):
+    """[(entry, why)] for a running job newly seen stalled: its --progress unchanged for STALL_SEC,
+    or the card at 0% load for STALL_SEC. Marks it, so each stall is reported once."""
+    out = []
+    r = running(q)
+    if not r or r.get("stalled") or r.get("started") is None:
+        return out
+    since = r.get("progress_since") or r["started"]
+    if r.get("progress") and now - since > STALL_SEC:
+        r["stalled"] = "progress"
+        out.append((r, "progress stuck at %r for %s" % (r["progress"], fmt_dur(now - since))))
+    elif r.get("idle_since") and now - r["idle_since"] > STALL_SEC:
+        r["stalled"] = "idle"
+        out.append((r, "its card has been idle (0%% load) for %s" % fmt_dur(now - r["idle_since"])))
+    return out
+
+
+def ending(e, now, code=None):
+    """How a job that left the line ended: {ran_sec, exit, kind, early}. kind is None for a
+    normal end, "failed" for a non-zero exit (or a signal), "ended early" for a job that left
+    within EARLY_SEC without saying how it exited, unless it was meant to be that short."""
+    ran = now - e["started"] if e.get("started") is not None else None
+    early = ran is not None and ran < EARLY_SEC
+    kind = None
+    if code is not None and code != 0:
+        kind = "failed"
+    elif code is None and early and not (e.get("est_min") and ran >= e["est_min"] * 30):
+        kind = "ended early"
+    return {"ran_sec": ran, "exit": code, "kind": kind, "early": bool(kind and early)}
 
 
 def done(q, now, eid):

@@ -26,7 +26,9 @@ INSTRUCTIONS = (
     "'go', then run your work with the returned env (CUDA_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES) "
     "and call gpuq_beat at least every 10 minutes. If a beat or any result says 'yield', stop your "
     "GPU work and go back to polling gpuq_start: you resume when you are #1 again. Call gpuq_done "
-    "when finished. Never use a GPU without a 'go'.")
+    "when finished, with exit_code. If a job of yours dies, is purged or stalls, a notice comes back "
+    "on your next tool call (and via gpuq_inbox): read it, check the log, tell your human. "
+    "Never use a GPU without a 'go'.")
 
 _HOST = {"host": {"type": "string", "description": "machine to act on (ssh); default: this one"}}
 _ID = {"id": {"type": "string", "description": "the id gpuq_join returned"}}
@@ -66,6 +68,11 @@ TOOLS = [
          level={"type": "string", "enum": ["chill", "normal", "important", "ablaze", "preempt"],
                 "description": "a named priority; preempt = one above the running job's"},
          important={"type": "boolean", "description": "same as level important"},
+         contact={"type": "string", "description": "who is told if the job dies, is purged or stalls "
+                  "(comma-separated; default: owner). Notices come back on your tool calls and via gpuq_inbox"},
+         desktop={"type": "boolean", "description": "also pop a desktop notice for the human. Only when "
+                  "they asked for it"},
+         log={"type": "string", "description": "path of the job's log file, quoted in notices"},
          gpu={"type": "string", "description": "a specific card by name (see gpuq_inventory)"})}},
     {"name": "gpuq_start",
      "description": "Try to take the GPU. state 'go': run now with env. 'wait': not your turn (or a yield was "
@@ -77,8 +84,16 @@ TOOLS = [
      "inputSchema": {"type": "object", "required": ["id"], "properties": dict(
          _ID, **_HOST, progress={"type": "string", "description": "e.g. 41/80"})}},
     {"name": "gpuq_done",
-     "description": "Release the GPU and leave the line.",
-     "inputSchema": {"type": "object", "required": ["id"], "properties": dict(_ID, **_HOST)}},
+     "description": "Release the GPU and leave the line. Pass exit_code: non-zero (or ending within 10 "
+                    "minutes without one) tells the job's contact.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": dict(
+         _ID, **_HOST, exit_code={"type": "integer", "description": "the job's exit code; 0 = success"})}},
+    {"name": "gpuq_inbox",
+     "description": "Notices for a contact: jobs that died (exit code, early death), were purged (no "
+                    "heartbeat) or stalled, with the log path. Unread ones are marked read.",
+     "inputSchema": {"type": "object", "required": ["contact"], "properties": dict(
+         _HOST, contact={"type": "string", "description": "the contact (usually your owner name)"},
+         all={"type": "boolean", "description": "every notice kept, read or not"})}},
 ]
 
 
@@ -114,6 +129,7 @@ class Server:
     def __init__(self, cli_runner=run_cli):
         self.run = cli_runner
         self.held = {}      # id -> host: jobs this session started, beaten on every call
+        self.watch = set()  # (contact, host): inboxes checked on every call, from this session's joins
 
     # ---- tools ----
     def call(self, name, a):
@@ -152,13 +168,38 @@ class Server:
                 args.append("--" + spec["level"])
             elif spec.get("important"):
                 args.append("--important")
-            return _json_of(*self.run(args, host))
+            if a.get("contact"):
+                args += ["--contact", a["contact"]]
+            if a.get("desktop"):
+                args.append("--desktop")
+            if a.get("log"):
+                args += ["--log", a["log"]]
+            res = _json_of(*self.run(args, host))
+            if res.get("ok"):
+                for c in (a.get("contact") or a["owner"]).split(","):
+                    if c.strip():
+                        self.watch.add((c.strip(), host))
+            return res
+        if name == "gpuq_inbox":
+            if not a.get("contact"):
+                return {"ok": False, "state": "error", "message": "contact is required"}
+            args = ["inbox", "--json", "--contact", a["contact"]] + (["--all"] if a.get("all") else ["--ack"])
+            if host:
+                args += ["--hosts", host]
+            host = None     # inbox reaches other machines itself
+            rc, out, err = self.run(args, host)
+            try:
+                return {"ok": True, "notices": json.loads(out)}
+            except ValueError:
+                return {"ok": False, "state": "error", "message": (err.strip() or "no output").splitlines()[-1]}
         if name in ("gpuq_start", "gpuq_beat", "gpuq_done"):
             if not a.get("id"):
                 return {"ok": False, "state": "error", "message": "id is required"}
             verb = name[5:]
             args = [verb, a["id"], "--json"] + (["--progress", a["progress"]]
                                                 if verb == "beat" and a.get("progress") else [])
+            if verb == "done" and a.get("exit_code") is not None:
+                args.append("--exit=%d" % int(a["exit_code"]))
             res = _json_of(*self.run(args, host))
             st = res.get("state")
             if verb == "start" and st == "go":
@@ -203,6 +244,18 @@ class Server:
             elif res.get("state") in ("purged", "error") and res.get("code") == 4:
                 self.held.pop(eid, None)
                 notices.append({"id": eid, "state": "purged", "message": "%s is no longer in line: stop" % eid})
+        for contact, host in sorted(self.watch, key=str):
+            from . import cli
+            rc, out, err = self.run(["inbox", "--json", "--ack", "--contact", contact,
+                                     "--hosts", host or cli.HOST], host)
+            try:
+                got = json.loads(out)
+            except ValueError:
+                continue
+            for n in got:
+                notices.append({"id": n["id"], "state": n["kind"], "contact": contact,
+                                "message": "%s (%s) %s: %s%s" % (n.get("job"), n["id"], n["kind"], n.get("text"),
+                                                                "; log: %s" % n["log"] if n.get("log") else "")})
         return notices
 
     # ---- JSON-RPC ----

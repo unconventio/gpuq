@@ -64,8 +64,8 @@ lacks `~/.local/bin`.
 | `gpuq join ...` | get in line, prints an id. `--vram GB` / `--tag T` pick a card that fits (shortest wait, then the smallest card); `--gpu` names one. `--est` minutes (default: the median of this job's past runs). `--priority chill\|normal\|important\|ablaze\|preempt\|N` (below) `--spec FILE` (or `-` for stdin) reads all of it as one JSON object |
 | `gpuq start ID` | exit 0 = you hold the card. Exit **3** = not your turn yet (or a yield was acknowledged): retry in a minute. Prints `CUDA_VISIBLE_DEVICES=GPU-<uuid>` (or `ROCR_VISIBLE_DEVICES=…`) on multi-card hosts |
 | `gpuq beat ID [--progress 41/80]` | heartbeat, about every 60 s (silent 15 min = purged). Exit **4** = you were purged: stop. Exit **5** = yield: stop your GPU work, go back to polling `start` |
-| `gpuq done ID` | finished, leave the line |
-| `gpuq run ID [--free] [--on-stop SH] [--progress-file F] -- CMD...` | does all of the above. On a yield it sends CMD's process group SIGTERM (SIGKILL after `--grace`, default 30 s) and **reruns CMD from the start** when you are #1 again, so CMD must be safe to rerun (checkpoint yourself). `--free` frees the card's residents once granted and restarts what it stopped at the end |
+| `gpuq done ID [--exit CODE]` | finished, leave the line. Give the exit code: a non-zero one tells the job's contact (below). `--quiet` = a deliberate stop, no notice |
+| `gpuq run ID [--free] [--on-stop SH] [--progress-file F] [--log PATH\|-] -- CMD...` | does all of the above, and saves CMD's output to `~/.local/state/gpuq/logs/ID.log` while still showing it (CMD runs on a pseudo-terminal, so progress bars keep working; `--log -` saves nothing). It passes the exit code to `done` and samples the card's memory and load with each beat. On a yield it sends CMD's process group SIGTERM (SIGKILL after `--grace`, default 30 s) and **reruns CMD from the start** when you are #1 again, so CMD must be safe to rerun (checkpoint yourself). `--free` frees the card's residents once granted and restarts what it stopped at the end |
 
 Add `--json` to `join`, `start`, `beat`, `done`, `env`, `edit`, `mv`, `yield` or `rm` for one JSON object instead:
 `{"ok", "code", "state", "message", …}` where `state` is `go` / `wait` / `gone` for `start` and `ok` / `yield` /
@@ -85,6 +85,32 @@ Hand-rolled holder loop:
       work finished on its own -> gpuq done $ID; exit
     done
 
+### When a job dies: notices
+
+A job names a contact with `gpuq join --contact NAME[,NAME]` (default: its owner). The contact gets a notice when
+the job
+
+- **fails**: `done --exit` non-zero, or killed by a signal (`gpuq run` reports both);
+- **dies early**: fails, or leaves with no exit code, within 10 minutes of getting the card (unless its own
+  estimate was that short);
+- **is purged**: no heartbeat for 15 minutes, or past its `--max`;
+- **stalls**: its `--progress` hasn't changed for 30 minutes, or its card sat at 0% load that long. Told once, until
+  it moves again.
+
+A notice holds the job, card, host, exit code, run time and log path. It is a line in
+`~/.local/state/gpuq/inbox/<contact>.jsonl` on the host where the job ran; readers pull it:
+
+    gpuq inbox --contact NAME [--ack]      # unread notices (--ack marks them read); --hosts a,b for other machines
+    gpuq inbox --contact NAME --follow     # keep printing new ones, e.g. under a session's Monitor
+
+The MCP server returns them on the session's next tool call, and the TUI shows them as red ⚠ lines (`a` dismisses
+them from the screen only; each reader keeps its own "read" mark). `join --desktop` also pops a desktop notice
+(`notify-send`) for that job, and an `ntfy` URL in the config sends those to your phone too. Whether a person is told
+is the job owner's choice; `"notify": {"desktop": "always"}` makes it yours.
+
+History keeps how each job ended: `exit`, run time, the card's peak memory and average load while it ran (whole
+card, residents included). Failed runs don't count toward estimates.
+
 Priority: any integer, higher goes first; the names are defaults: `chill` 5 (☾), `normal` 10, `important` 20 (★),
 `ablaze` 30 (⚑), and `preempt` = one above the running job's. A joining job goes just behind the last job of at least
 its priority, and outranking the running job asks it to yield (it resumes after). `--chill`, `--important`, `--ablaze`
@@ -101,11 +127,13 @@ skipped to the back (twice: removed). A job of at most 6 h goes ahead of jobs wi
 
     {"mcpServers": {"gpuq": {"command": "gpuq-mcp"}}}
 
-Tools: `gpuq_inventory`, `gpuq_where`, `gpuq_show`, `gpuq_join`, `gpuq_start`, `gpuq_beat`, `gpuq_done`; each takes
-an optional `host`. They return the same states as `--json`, plus a `next` hint for the agent.
+Tools: `gpuq_inventory`, `gpuq_where`, `gpuq_show`, `gpuq_join`, `gpuq_start`, `gpuq_beat`, `gpuq_done`,
+`gpuq_inbox`; each takes an optional `host`. `gpuq_join` takes `contact` and `desktop`, `gpuq_done` takes
+`exit_code`. They return the same states as `--json`, plus a `next` hint for the agent.
 
 Agents forget to heartbeat, so any tool call also beats every job that MCP session has started, and a pending yield
-for one of them comes back on *any* result as a `notices` entry. A session that makes no calls at all still goes
+for one of them comes back on *any* result as a `notices` entry, as do notices for the contacts of jobs that
+session joined. A session that makes no calls at all still goes
 stale after 15 minutes. For long work, `gpuq run ID -- CMD` in a shell beats by itself: use MCP to ask and hold,
 `gpuq run` to run.
 
@@ -157,7 +185,8 @@ Optional JSON at `~/.config/gpuq/config.json` (`$GPUQ_CONFIG`); `gpuq init` writ
 | `units` | `{process name: systemd user unit}` for old-form residents (default `<name>.service`) |
 | `hosts` | comma list for the multi-host views and `where` (default: this host) |
 | `remote_command` | gpuq on other hosts over non-interactive ssh (default `~/.local/bin/gpuq`) |
-| `rules` | `{"jump_ratio": 10, "jump_max_hours": 6, "priorities": {"chill": 5, "normal": 10, "important": 20, "ablaze": 30}}` |
+| `rules` | `{"jump_ratio": 10, "jump_max_hours": 6, "priorities": {"chill": 5, "normal": 10, "important": 20, "ablaze": 30}, "early_death_min": 10, "stall_min": 30}` |
+| `notify` | `{"desktop": "never"\|"always", "ntfy": URL, "command": SHELL}`: how notices leave the inbox. `command` gets `{id} {kind} {owner} {job} {exit} {log} {contact} {text}`, shell-quoted |
 | `compat_lock` | a lock file for older tools; written while a job runs, removed after |
 
 ## Cards and hosts
@@ -184,9 +213,10 @@ line per card of either kind.
 ## Limits
 
 Memory accounting is declarative: `--vram` is checked against what the card offers after reserves and residents,
-not against live usage. Jobs on a card run one at a time. No priorities beyond order and the short-job rule, no
-checkpointing, nothing enforces the line against processes that ignore it (they show up as "unqueued GPU use").
-Linux only. Purging a holder removes its place; it does not kill its process.
+not against live usage (live use is shown, and sampled per job as whole-card figures). Jobs on a card run one at a time. No checkpointing, nothing enforces the line against processes that ignore it (they show up as "unqueued GPU use").
+Linux only. Purging a holder removes its place; it does not kill its process. There is no daemon: purges and stalls
+are found by `gpuq sweep`, so install its timer (`examples/`) on every host. Logs and notices are never deleted by
+gpuq.
 
 ## Tests
 
