@@ -2,7 +2,7 @@
 
 GPU users:  ID=$(gpuq join --owner NAME --job TEXT --why TEXT --models a,b --est MIN --max MIN)
             gpuq start ID     (exit 3 = not your turn yet; retry in a minute)
-            gpuq beat ID [--progress 41/80]   at least every 15 min (exit 4 = you were purged: stop;
+            gpuq beat ID [--progress 41/80]   about every minute; 15 min silent = purged (exit 4: stop;
                                               exit 5 = yield: stop your GPU work, go back to polling start)
             gpuq done ID
             or all of that in one:  gpuq run ID [--on-stop CMD] [--progress-file F] -- CMD ...
@@ -15,7 +15,7 @@ Humans:     gpuq                          the live view (TUI) at a terminal; pip
             gpuq mv 3 1  ·  gpuq rm 4     reorder / remove (by position or id); moving the running
                                           job, or anything above it, asks it to yield
             gpuq yield ID [N]             ask the running job to step back to #N (default 2)
-            gpuq pause  ·  gpuq resume    hold the line (nobody may start) / let it go
+            gpuq pause  ·  gpuq resume    freeze every line here (nobody may start) / let them go
             gpuq evac [CARD] [--to C]     move a card's resident services off it (free the whole card)
             gpuq restore [CARD]           put the residents back ([--dry-run] on either to preview)
             gpuq --host a mv 3 1          do it on another machine over SSH
@@ -1735,7 +1735,9 @@ def _tui(args):
 # ---- CLI ----
 
 def _forward(argv, host):
-    """Re-run this command on HOST, minus the --host option."""
+    """Re-run this command on HOST, minus the --host option (anywhere before a `--`; CMD is untouched)."""
+    cut = argv.index("--") if "--" in argv else len(argv)
+    argv, tail = argv[:cut], argv[cut:]
     rest, skip = [], False
     for a in argv:
         if skip:
@@ -1744,6 +1746,7 @@ def _forward(argv, host):
             skip = True
         elif not a.startswith("--host="):
             rest.append(a)
+    rest += tail
     cmd = remote_cmd() + (" " + shlex.join(rest) if rest else "")
     return subprocess.call(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, cmd])
 
@@ -1768,26 +1771,62 @@ def apply_rules(cfg):
         core.STALL_SEC = float(r["stall_min"]) * 60
 
 
+class CommaList(argparse.Action):
+    """A comma list that may also be repeated: --hosts a,b --hosts c -> "a,b,c" (kept as one string)."""
+    def __call__(self, parser, ns, value, option=None):
+        given = getattr(ns, "_given", set())
+        old = getattr(ns, self.dest, None) if self.dest in given else None
+        setattr(ns, self.dest, value if old in (None, "") else old + "," + value)
+        ns._given = given | {self.dest}
+
+
+class TagList(argparse.Action):
+    """--tag a --tag b or --tag a,b -> ["a", "b"]."""
+    def __call__(self, parser, ns, value, option=None):
+        setattr(ns, self.dest, (getattr(ns, self.dest, None) or []) + [t.strip() for t in value.split(",") if t.strip()])
+
+
+EPILOG = """exit codes:
+  0  ok
+  1  failed (a resident didn't restart, a remote host didn't answer); `run` exits with CMD's code
+  2  bad input: unknown card, nothing fits, wrong flags
+  3  not your turn yet (start), or the queue is paused: retry in a minute
+  4  gone: no such entry — the id is no longer in line (purged, removed, done): stop
+  5  yield (beat): stop the GPU work, go back to polling start
+
+`gpuq COMMAND --help` for a command's flags. Flags that take a list accept commas and may repeat."""
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     apply_rules(config())
-    ap = argparse.ArgumentParser(prog="gpuq", description=__doc__,
+    ap = argparse.ArgumentParser(prog="gpuq", description=__doc__, epilog=EPILOG, allow_abbrev=False,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--host", help="run the command against HOST's queue over ssh")
-    sub = ap.add_subparsers(dest="cmd")
-    card = argparse.ArgumentParser(add_help=False)
-    card.add_argument("--gpu", help="which card's line, by model number (e.g. 3060); see `gpuq show`")
-    view = argparse.ArgumentParser(add_help=False)   # layout flag, shared by show/watch/tui
+    ap.add_argument("--host", help="run the command against HOST's queue over ssh (also after the command)")
+    sub = ap.add_subparsers(dest="cmd", title="commands", metavar="COMMAND")
+    _parent = lambda: argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    hostp = _parent()       # --host after the command means the same as before it
+    hostp.add_argument("--host", default=argparse.SUPPRESS, help="run it on HOST's queue over ssh")
+
+    def cmd_parser(name, help, parents=(), **kw):
+        return sub.add_parser(name, help=help, description=kw.pop("description", help[:1].upper() + help[1:]),
+                              parents=[hostp, *parents], allow_abbrev=False, **kw)
+
+    card = _parent()
+    card.add_argument("--gpu", "--card", dest="gpu", metavar="CARD",
+                      help="which card's line positions count in, by model number (e.g. 3060);"
+                           " default: the default card")
+    view = _parent()        # layout flag, shared by show/watch
     view.add_argument("--mode", choices=["classic", "cards", "bars", "list"], default="classic",
                       help="layout: classic (default), cards, bars, or list")
-    jsonp = argparse.ArgumentParser(add_help=False)  # --json on action commands: one JSON object out
+    jsonp = _parent()       # --json on action commands: one JSON object out
     jsonp.add_argument("--json", action="store_true",
                        help="print one JSON object: ok, code, state, message, plus the command's fields")
-    need = argparse.ArgumentParser(add_help=False)   # what a job needs from a card
+    need = _parent()        # what a job needs from a card
     need.add_argument("--vram", type=float, metavar="GB", help="GPU memory the job needs, in GB")
-    need.add_argument("--tag", action="append", default=None, metavar="TAG",
+    need.add_argument("--tag", action=TagList, default=None, metavar="TAG[,TAG]",
                       help="card tag the job needs (cuda, rocm, igpu, or your own); repeatable")
-    prio_p = argparse.ArgumentParser(add_help=False)  # where a job goes in line
+    prio_p = _parent()      # where a job goes in line
     g = prio_p.add_mutually_exclusive_group()
     g.add_argument("--priority", metavar="LEVEL|N",
                    help="%s, preempt (one above the running job), or any integer; higher goes first,"
@@ -1799,133 +1838,152 @@ def main(argv=None):
     g.add_argument("--preempt", dest="level", action="store_const", const="preempt",
                    help="one above the running job's priority: it yields, you go next")
     hosts_default = config().get("hosts") or HOST   # config "hosts": comma list; default = this host
-    p = sub.add_parser("show", help="print the queue once", parents=[view])
-    p.add_argument("--json", action="store_true")
-    p.add_argument("--hosts", default=hosts_default,
-                   help="comma-separated hosts (default: %s); --json is always local only"
-                        % hosts_default)
-    p = sub.add_parser("watch", help="live view, refreshed", parents=[view])
-    p.add_argument("--hosts", default=hosts_default, help="comma-separated (default: %s)" % hosts_default)
-    p.add_argument("--every", type=float, default=5, help="seconds between refreshes")
-    p = sub.add_parser("tui", help="interactive view: select, reorder, remove")
-    p.add_argument("--hosts", default=hosts_default, help="comma-separated (default: %s)" % hosts_default)
-    p.add_argument("--every", type=float, default=5, help="seconds between refreshes")
-    p = sub.add_parser("join", help="get in line; prints your id", parents=[card, need, prio_p, jsonp])
+    hostsp = _parent()      # which machines a view or report covers
+    hostsp.add_argument("--hosts", action=CommaList, default=hosts_default, metavar="HOST[,HOST]",
+                        help="machines to cover; repeatable (default: %s)" % hosts_default)
+    hostsp.add_argument("--local", action="store_true", help="this host only (same as --hosts %s)" % HOST)
+    readjson = _parent()    # --json on read-only commands: the data itself, no envelope
+    readjson.add_argument("--json", action="store_true", help="print the data as JSON (no ok/code envelope)")
+    resj = _parent()        # --json on the resident commands: the envelope, with what was printed as "lines"
+    resj.add_argument("--json", action="store_true",
+                      help="print one JSON object: ok, code, state, message, card, lines")
+    resj.add_argument("--dry-run", action="store_true", help="show what would be done; change nothing")
+    resj.add_argument("--gpu", "--card", dest="card_opt", metavar="CARD", help="the card (same as the CARD argument)")
+
+    def job_fields(p, editing=False):
+        """The flags join and edit share: what the job is, its time, and who hears about it."""
+        p.add_argument("--job", help="what the job is — be descriptive; reuse the same text for repeat jobs"
+                                     " (estimates come from past runs of it)")
+        p.add_argument("--why", default=None if editing else "",
+                       help="why it's running / who it's for — a full phrase is fine")
+        p.add_argument("--models", action=CommaList, default=None if editing else "", metavar="NAME[,NAME]",
+                       help="the models it loads; repeatable")
+        p.add_argument("--est", type=int, metavar="MIN",
+                       help="expected minutes" + ("" if editing else
+                                                  " (default: the median of this job's past runs)"))
+        p.add_argument("--max", "--limit", dest="max", type=int, metavar="MIN",
+                       help="hard limit in minutes: the sweep purges the job after this")
+        p.add_argument("--contact", action=CommaList, default=None, metavar="NAME[,NAME]",
+                       help="who is told if the job dies, is purged or stalls; repeatable (default: the"
+                            " owner%s); read with `gpuq inbox`" % (", and \"\" goes back to it" if editing else ""))
+        if editing:
+            p.add_argument("--desktop", "--notify", dest="desktop", action=argparse.BooleanOptionalAction,
+                           default=None, help="pop a desktop notice (and ntfy, if configured) when that"
+                                              " happens, or stop doing so")
+        else:
+            p.add_argument("--desktop", "--notify", dest="desktop", action="store_true",
+                           help="also pop a desktop notice (and ntfy, if configured) when that happens")
+        p.add_argument("--log", metavar="PATH",
+                       help="the job's log file, quoted in notices" + (" (\"\" = none)" if editing else ""))
+
+    # -- GPU users: the job protocol --
+    p = cmd_parser("join", "get in line; prints your id", [need, prio_p, jsonp])
+    p.add_argument("--gpu", "--card", dest="gpu", metavar="CARD",
+                   help="the card's line to join, by model number (default: picked from --vram/--tag,"
+                        " else the owner's or the default card)")
     p.add_argument("--spec", metavar="FILE",
                    help="read the job as a JSON object from FILE (- = stdin): owner, job, why, models,"
                         " est, max, priority (or level: chill/normal/important/ablaze/preempt), gpu,"
                         " vram, tags; flags given as well win")
-    p.add_argument("--owner")
-    p.add_argument("--job",
-                   help="what the job is — be descriptive; the tui shows it in full, short views trim")
-    p.add_argument("--why", default="",
-                   help="why it's running / who it's for — a full phrase is fine; shown in full in the tui")
-    p.add_argument("--models", default="", help="comma-separated")
-    p.add_argument("--est", type=int, help="expected minutes (default: the median of this job's past runs)")
-    p.add_argument("--max", type=int, help="minutes after which the sweep purges you")
+    p.add_argument("--owner", help="who you are: a person, session or project (required unless in --spec)")
+    job_fields(p)
     p.add_argument("--no-history", action="store_true", help="don't estimate from past runs")
-    p.add_argument("--contact", metavar="NAME[,NAME]",
-                   help="who is told if the job dies, is purged or stalls (default: the owner);"
-                        " read with `gpuq inbox`")
-    p.add_argument("--desktop", action="store_true",
-                   help="also pop a desktop notice (and ntfy, if configured) when that happens")
-    p.add_argument("--log", metavar="PATH", help="the job's log file, quoted in notices")
-    p = sub.add_parser("edit", help="change an entry's details; id and place are kept"
-                       " (--gpu moves a waiting entry to the end of that card's line)",
-                       parents=[card, need, prio_p, jsonp])
-    p.add_argument("id")
-    for f in ("--job", "--why", "--models"):
-        p.add_argument(f)
-    p.add_argument("--est", type=int)
-    p.add_argument("--max", type=int)
-    p.add_argument("--contact", metavar="NAME[,NAME]",
-                   help="who is told if the job dies, is purged or stalls (\"\" = back to the owner)")
-    p.add_argument("--desktop", action=argparse.BooleanOptionalAction, default=None,
-                   help="pop a desktop notice (and ntfy) when that happens, or stop doing so")
-    p.add_argument("--log", metavar="PATH", help="the job's log file, quoted in notices (\"\" = none)")
-    p = sub.add_parser("start", help="take the GPU (only as #1)", parents=[jsonp])
-    p.add_argument("id")
-    p.add_argument("--log", metavar="PATH", help="record the job's log file (gpuq run does)")
+    p = cmd_parser("start", "take the GPU (only as #1); prints the card's env line", [jsonp])
+    p.add_argument("id", metavar="ID", help="the id join printed")
+    p.add_argument("--log", metavar="PATH", help="record the job's log file (gpuq run sets this)")
     p.add_argument("--adopt", action="store_true",
                    help="take over a lock file written outside gpuq (backfilling a live job)")
-    p = sub.add_parser("beat", help="heartbeat, about every minute; silent 15 min = purged"
-                       " (exit 4 = purged: stop; 5 = yield: stop, poll start)",
-                       parents=[jsonp])
-    p.add_argument("id")
-    p.add_argument("--progress")
-    p.add_argument("--mem", type=float, metavar="GB", help="the card's memory in use now, in GB (gpuq run samples it)")
-    p.add_argument("--util", type=int, metavar="PCT", help="the card's load now, in percent")
-    p = sub.add_parser("done", help="release the GPU and leave the line", parents=[jsonp])
-    p.add_argument("id")
+    p = cmd_parser("beat", "heartbeat, about every minute; 15 min silent = purged"
+                   " (exit 4 = purged: stop; 5 = yield: stop, poll start)", [jsonp])
+    p.add_argument("id", metavar="ID", help="the job's id")
+    p.add_argument("--progress", metavar="TEXT", help="how far along, e.g. 41/80; unchanged 30 min = stalled")
+    p.add_argument("--mem", type=float, metavar="GB", help="the card's memory in use now, in GB (gpuq run sets this)")
+    p.add_argument("--util", type=int, metavar="PCT", help="the card's load now, in percent (gpuq run sets this)")
+    p = cmd_parser("done", "release the GPU and leave the line", [jsonp])
+    p.add_argument("id", metavar="ID", help="the job's id")
     p.add_argument("--exit", type=int, metavar="CODE",
                    help="the job's exit code (negative: killed by that signal); non-zero tells its contact")
     p.add_argument("--no-notice", "--quiet", dest="quiet", action="store_true",
                    help="tell nobody, however it ended (a deliberate stop)")
-    p = sub.add_parser("env", help="print the job's card as CUDA_VISIBLE_DEVICES=GPU-<uuid>", parents=[jsonp])
-    p.add_argument("id")
-    p = sub.add_parser("mv", help="move an entry (position or id) to a position", parents=[card, jsonp])
-    p.add_argument("src")
-    p.add_argument("dst")
-    p = sub.add_parser("run", help="hold the GPU for CMD: start, beat, stop on yield, rerun at #1, done",
-                       usage="gpuq run ID [--every S] [--grace S] [--on-stop SHELL] [--progress-file F] [--free]"
-                             " [--log PATH|-] -- CMD ...",
-                       description="Runs CMD in its own process group once ID may start, beats every"
-                       " --every seconds, stops it on a yield (beat exit 5) and reruns it from the"
-                       " start when ID is #1 again — so CMD must be safe to rerun. Calls done when"
-                       " CMD ends, or when this wrapper is interrupted. Exits with CMD's code.")
-    p.add_argument("id")
-    p.add_argument("--every", type=float, default=60, help="seconds between beats / start polls")
-    p.add_argument("--grace", type=float, default=30, help="seconds after SIGTERM before SIGKILL")
-    p.add_argument("--on-stop", help="shell command run after CMD is stopped (e.g. unload a model)")
-    p.add_argument("--progress-file", help="its last line is sent as --progress with each beat")
+    p = cmd_parser("run", "hold the GPU for CMD: start, beat, stop on yield, rerun at #1, done",
+                   usage="gpuq run ID [options] -- CMD ...",
+                   description="Runs CMD in its own process group once ID may start, beats every"
+                   " --every seconds, stops it on a yield (beat exit 5) and reruns it from the"
+                   " start when ID is #1 again — so CMD must be safe to rerun. Calls done when"
+                   " CMD ends, or when this wrapper is interrupted. Exits with CMD's code."
+                   " Everything after -- is CMD; gpuq never reads it.")
+    p.add_argument("id", metavar="ID", help="the id join printed")
+    p.add_argument("--every", type=float, default=60, metavar="SEC", help="seconds between beats / start polls")
+    p.add_argument("--grace", type=float, default=30, metavar="SEC", help="seconds after SIGTERM before SIGKILL")
+    p.add_argument("--on-stop", metavar="SHELL", help="shell command run after CMD is stopped (e.g. unload a model)")
+    p.add_argument("--progress-file", metavar="FILE", help="its last line is sent as --progress with each beat")
     p.add_argument("--free", action="store_true",
                    help="free the card's residents (`gpuq free`) once granted; restart what it stopped at the end")
-    p.add_argument("--log", metavar="PATH",
-                   help="where CMD's output is saved as well (default: STATE/logs/ID.log; - = don't save)")
-    p = sub.add_parser("yield", help="ask the running job to step back (default to #2)", parents=[jsonp])
-    p.add_argument("id")
-    p.add_argument("to", nargs="?")
-    p = sub.add_parser("rm", help="remove an entry (position or id)", parents=[card, jsonp])
-    p.add_argument("ref")
-    sub.add_parser("pause", help="hold the line: nobody may start until resume")
-    sub.add_parser("resume", help="release the line; #1 gets a fresh 15 minutes")
-    sub.add_parser("sweep", help="garbage collection (the timer runs this)")
-    p = sub.add_parser("evac", help="move a card's resident services off it, to free the whole card")
-    p.add_argument("card", nargs="?", help="card to empty (default: the config default card)")
-    p.add_argument("--to", help="card to move residents to (default: the other card)")
-    p.add_argument("--dry-run", action="store_true", help="show what would move; change nothing")
-    p = sub.add_parser("restore", help="undo an evac or a free: residents back on their home card, running")
-    p.add_argument("card", nargs="?")
-    p.add_argument("--dry-run", action="store_true", help="show what would change; change nothing")
-    p = sub.add_parser("free", help="release a card's resident memory: unload models, or stop units")
-    p.add_argument("card", nargs="?", help="card (default: the host default)")
-    p.add_argument("--dry-run", action="store_true", help="show what would be done; change nothing")
-    p = sub.add_parser("inventory", help="what every card offers: usable memory, tags, residents, wait")
-    p.add_argument("--json", action="store_true")
-    p.add_argument("--hosts", default=hosts_default, help="comma-separated (default: %s)" % hosts_default)
-    p.add_argument("--local", action="store_true", help="this host only")
-    p = sub.add_parser("where", help="which card, on which host, can take a job — and how soon",
-                       parents=[need, prio_p])
-    p.add_argument("--est", type=int, help="the job's minutes (applies the short-job jump to the wait)")
-    p.add_argument("--json", action="store_true")
-    p.add_argument("--hosts", default=hosts_default, help="comma-separated (default: %s)" % hosts_default)
-    p.add_argument("--local", action="store_true", help="this host only")
-    p = sub.add_parser("init", help="write a starter config from the cards (and servers) found here")
-    p.add_argument("--print", action="store_true", help="print it; write nothing")
-    p.add_argument("--force", action="store_true", help="replace an existing config (kept as .bak)")
-    sub.add_parser("mcp", help="serve the queue to AI agents over MCP (stdio)")
-    p = sub.add_parser("inbox", help="notices: jobs that died, were purged or stalled")
-    p.add_argument("--contact", help="only this contact's notices (default: everyone's)")
+    p.add_argument("--log", metavar="PATH|-",
+                   help="save CMD's output here as well and record it for notices"
+                        " (default: STATE/logs/ID.log; - = don't save)")
+    p = cmd_parser("env", "print the job's card as CUDA_VISIBLE_DEVICES=GPU-<uuid>", [jsonp])
+    p.add_argument("id", metavar="ID", help="the job's id")
+    p = cmd_parser("edit", "change a job's details; its id and place are kept", [need, prio_p, jsonp])
+    p.add_argument("id", metavar="ID", help="the job's id (not a position)")
+    p.add_argument("--gpu", "--card", dest="gpu", metavar="CARD",
+                   help="move a waiting job to the end of CARD's line")
+    job_fields(p, editing=True)
+    p = cmd_parser("inbox", "notices: jobs that died, were purged or stalled", [hostsp, readjson])
+    p.add_argument("--contact", metavar="NAME", help="only this contact's notices (default: everyone's)")
     p.add_argument("--reader", help=argparse.SUPPRESS)   # whose "read" mark: default the contact, else "screen"
     p.add_argument("--all", action="store_true", help="every notice kept, read or not")
     p.add_argument("--ack", action="store_true", help="mark what is shown as seen")
-    p.add_argument("--follow", action="store_true", help="keep printing new notices as they come (for Monitor)")
-    p.add_argument("--json", action="store_true")
-    p.add_argument("--hosts", default=hosts_default, help="comma-separated (default: %s)" % hosts_default)
+    p.add_argument("--follow", action="store_true",
+                   help="keep printing new notices as they come (for a watcher process)")
+    # -- Humans: look and steer --
+    p = cmd_parser("show", "print the queue once", [view, hostsp])
+    p.add_argument("--json", action="store_true",
+                   help="this host's snapshot as JSON (no envelope; --host for another machine)")
+    p = cmd_parser("watch", "live view, refreshed", [view, hostsp])
+    p.add_argument("--every", type=float, default=5, metavar="SEC", help="seconds between refreshes")
+    p = cmd_parser("tui", "interactive view: select, reorder, remove", [hostsp])
+    p.add_argument("--every", type=float, default=5, metavar="SEC", help="seconds between refreshes")
+    p = cmd_parser("mv", "move an entry (position or id) to a position", [card, jsonp])
+    p.add_argument("src", metavar="ID|POS", help="the entry to move")
+    p.add_argument("dst", metavar="POS", help="where to put it (1 = next to run)")
+    p = cmd_parser("rm", "remove an entry (position or id); never kills a process", [card, jsonp])
+    p.add_argument("ref", metavar="ID|POS", help="the entry to remove")
+    p = cmd_parser("yield", "ask the running job to step back (default to #2)", [jsonp])
+    p.add_argument("id", metavar="ID", help="the running job's id")
+    p.add_argument("to", nargs="?", metavar="POS", help="where it waits after (default: 2)")
+    cmd_parser("pause", "freeze every card's line on this host: nobody may start until `resume`")
+    cmd_parser("resume", "let the lines go again; each #1 gets a fresh 15 minutes")
+    # -- Fleet: cards, residents, setup --
+    p = cmd_parser("inventory", "what every card offers: usable memory, tags, residents, wait",
+                   [hostsp, readjson])
+    p = cmd_parser("where", "which card, on which host, can take a job — and how soon",
+                   [need, prio_p, hostsp, readjson])
+    p.add_argument("--est", type=int, metavar="MIN", help="the job's minutes (applies the short-job jump to the wait)")
+    p = cmd_parser("free", "residents: unload models or stop units to free a card's memory", [resj])
+    p.add_argument("card", nargs="?", metavar="CARD", help="the card (default: the default card)")
+    p = cmd_parser("evac", "residents: move a card's servers to another card, to free the whole card", [resj])
+    p.add_argument("card", nargs="?", metavar="CARD", help="the card to empty (default: the default card)")
+    p.add_argument("--to", metavar="CARD", help="card to move residents to (default: the other card)")
+    p = cmd_parser("restore", "residents: undo an evac or a free — back on their home card, running", [resj])
+    p.add_argument("card", nargs="?", metavar="CARD", help="only this card's (default: whatever was moved or freed)")
+    p = cmd_parser("init", "write a starter config from the cards (and servers) found here")
+    p.add_argument("--print", "--dry-run", dest="print", action="store_true", help="print it; write nothing")
+    p.add_argument("--force", action="store_true", help="replace an existing config (kept as .bak)")
+    cmd_parser("mcp", "serve the queue to AI agents over MCP (stdio)")
+    # -- Timer --
+    cmd_parser("sweep", "garbage collection: purge silent or over-limit jobs, skip no-shows, report stalls"
+               " (the timer runs this every minute)")
     # everything after the first "--" is gpuq run's command, never gpuq's own options
     head, run_cmd = (argv[:argv.index("--")], argv[argv.index("--") + 1:]) if "--" in argv else (argv, [])
     args = ap.parse_args(head)
     args.run_cmd = run_cmd
+    if getattr(args, "local", False):
+        args.hosts = HOST
+    if hasattr(args, "card_opt"):
+        if args.card and args.card_opt and args.card != args.card_opt:
+            ap.error("two different cards: %s and %s" % (args.card, args.card_opt))
+        args.card = args.card or args.card_opt
 
     if args.host and args.host != HOST:
         return _forward(argv, args.host)
@@ -1951,7 +2009,7 @@ def main(argv=None):
     return rc
 
 
-ACTION_JSON = {"join", "edit", "start", "beat", "done", "env", "mv", "yield", "rm"}
+ACTION_JSON = {"join", "edit", "start", "beat", "done", "env", "mv", "yield", "rm", "evac", "restore", "free"}
 STATES = {"start": {0: "go", 3: "wait", 4: "gone"}, "beat": {0: "ok", 4: "purged", 5: "yield"}}
 
 
@@ -1971,6 +2029,9 @@ def _run(args, now):
         cmd = "show"
     if cmd == "show":
         if getattr(args, "json", False):
+            if "hosts" in getattr(args, "_given", ()) and _hosts(args) != [HOST]:
+                raise QueueError(2, "show --json is this host's snapshot only; use --host H for another"
+                                    " machine, or `gpuq inventory --json` for several")
             print(json.dumps(local_snapshot(now)))    # machine-readable: always local, never recurses
             return 0
         color, mode = sys.stdout.isatty(), getattr(args, "mode", None) or "classic"
@@ -1997,12 +2058,17 @@ def _run(args, now):
         return _tui(args)
     if cmd == "run":
         return _hold(args)
-    if cmd == "evac":
-        return _evac(args, now)
-    if cmd == "restore":
-        return _restore(args, now)
-    if cmd == "free":
-        return _free(args, now)
+    if cmd in ("evac", "restore", "free"):
+        fn = {"evac": _evac, "restore": _restore, "free": _free}[cmd]
+        if not getattr(args, "json", False):
+            return fn(args, now)
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = fn(args, now)
+        args.result.update(card=args.card, dry_run=args.dry_run, lines=buf.getvalue().splitlines())
+        return rc
     if cmd == "inventory":
         return _inventory(args, now)
     if cmd == "where":
@@ -2128,8 +2194,8 @@ def _run(args, now):
             if not as_json:
                 print(pin or "")
         elif cmd == "edit":
-            q = line_of(args.id)
-            e = q[find(q, args.id)]
+            q = line_of(args.id, by_id=True)
+            e = q[find(q, args.id, by_id=True)]
             for key, val in (("job", args.job), ("why", args.why), ("est_min", args.est),
                              ("max_min", args.max)):
                 if val is not None:

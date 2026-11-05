@@ -24,14 +24,31 @@ INSTRUCTIONS = (
     "gpuq is a numbered queue per GPU card, per machine. To use a GPU: gpuq_where to find a card "
     "(optional), gpuq_join to get in line (keep the id), poll gpuq_start every ~60 s until state is "
     "'go', then run your work with the returned env (CUDA_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES) "
-    "and call gpuq_beat at least every 10 minutes. If a beat or any result says 'yield', stop your "
+    "and call gpuq_beat about every minute (15 min silent = purged; any gpuq call also beats your jobs). If a beat or any result says 'yield', stop your "
     "GPU work and go back to polling gpuq_start: you resume when you are #1 again. Call gpuq_done "
     "when finished, with exit_code. If a job of yours dies, is purged or stalls, a notice comes back "
     "on your next tool call (and via gpuq_inbox): read it, check the log, tell your human. "
+    "gpuq_edit changes a job in line (contact, estimate, priority...); gpuq_yield asks a running job to step back. "
     "Never use a GPU without a 'go'.")
 
 _HOST = {"host": {"type": "string", "description": "machine to act on (ssh); default: this one"}}
 _ID = {"id": {"type": "string", "description": "the id gpuq_join returned"}}
+_PRIORITY = {"priority": {"type": ["integer", "string"],
+                          "description": "a number or a name: chill 5, normal 10, important 20, ablaze 30, or preempt"
+                                         " (one above the running job's). Higher goes first; outranking the running"
+                                         " job makes it yield"}}
+_HOSTS = {"hosts": {"type": "string", "description": "comma-separated machines; default: all configured"}}
+_JOB = {
+    "why": {"type": "string", "description": "why it runs / who it's for"},
+    "models": {"type": "array", "items": {"type": "string"}},
+    "max_min": {"type": "integer", "description": "hard limit in minutes: the sweep purges the job after this"},
+    "contact": {"type": "string", "description": "who is told if the job dies, is purged or stalls "
+                "(comma-separated; default: owner). Notices come back on your tool calls and via gpuq_inbox"},
+    "desktop": {"type": "boolean", "description": "also pop a desktop notice for the human. Only when "
+                "they asked for it"},
+    "log": {"type": "string", "description": "path of the job's log file, quoted in notices"},
+    "gpu": {"type": "string", "description": "a specific card by name (see gpuq_inventory)"},
+}
 _NEED = {
     "vram_gb": {"type": "number", "description": "GPU memory the job needs, GB"},
     "tags": {"type": "array", "items": {"type": "string"},
@@ -43,43 +60,29 @@ TOOLS = [
     {"name": "gpuq_inventory",
      "description": "What every card on every configured machine offers: usable memory (after reserve and "
                     "resident servers), tags, residents, queue length, current job, wait.",
-     "inputSchema": {"type": "object", "properties": dict(
-         hosts={"type": "string", "description": "comma-separated machines; default: all configured"})}},
+     "inputSchema": {"type": "object", "properties": dict(_HOSTS)}},
     {"name": "gpuq_where",
      "description": "Which card, on which machine, can take a job needing this memory/tags, best first, with "
                     "the estimated wait (short jobs may jump long ones). Join on the first row that fits.",
-     "inputSchema": {"type": "object", "properties": dict(_NEED, hosts={"type": "string"})}},
+     "inputSchema": {"type": "object", "properties": dict(_NEED, **_HOSTS, **_PRIORITY)}},
     {"name": "gpuq_show",
-     "description": "The queue on one machine: every card's line, in order, with states.",
-     "inputSchema": {"type": "object", "properties": dict(_HOST)}},
+     "description": "The queue on one machine (host) or several (hosts): every card's line, in order, with states.",
+     "inputSchema": {"type": "object", "properties": dict(_HOST, **_HOSTS)}},
     {"name": "gpuq_join",
      "description": "Get in line for a GPU. Without gpu, a card is picked from vram_gb/tags (shortest wait), "
                     "else the owner's or host's default. Without est_min, past runs of the same job are used. "
                     "Returns the id, card and position.",
      "inputSchema": {"type": "object", "required": ["owner", "job"], "properties": dict(
-         _NEED, **_HOST,
+         _NEED, **_HOST, **_JOB, **_PRIORITY,
          owner={"type": "string", "description": "who you are (session or project name)"},
          job={"type": "string", "description": "what the job is; reuse the same text for repeat jobs"},
-         why={"type": "string"},
-         models={"type": "array", "items": {"type": "string"}},
-         max_min={"type": "integer", "description": "minutes after which you are purged"},
-         priority={"type": "integer", "description": "higher goes first; normal 10, chill 5, important 20,"
-                   " ablaze 30. Outranking the running job makes it yield"},
-         level={"type": "string", "enum": ["chill", "normal", "important", "ablaze", "preempt"],
-                "description": "a named priority; preempt = one above the running job's"},
-         important={"type": "boolean", "description": "same as level important"},
-         contact={"type": "string", "description": "who is told if the job dies, is purged or stalls "
-                  "(comma-separated; default: owner). Notices come back on your tool calls and via gpuq_inbox"},
-         desktop={"type": "boolean", "description": "also pop a desktop notice for the human. Only when "
-                  "they asked for it"},
-         log={"type": "string", "description": "path of the job's log file, quoted in notices"},
-         gpu={"type": "string", "description": "a specific card by name (see gpuq_inventory)"})}},
+         no_history={"type": "boolean", "description": "don't estimate est_min from past runs"})}},
     {"name": "gpuq_start",
      "description": "Try to take the GPU. state 'go': run now with env. 'wait': not your turn (or a yield was "
                     "acknowledged), call again in ~60 s. 'gone': the id is no longer in line.",
      "inputSchema": {"type": "object", "required": ["id"], "properties": dict(_ID, **_HOST)}},
     {"name": "gpuq_beat",
-     "description": "Heartbeat while you hold the GPU (at least every 10 min). state 'yield': stop your GPU "
+     "description": "Heartbeat while you hold the GPU, about every minute (15 min silent = purged). state 'yield': stop your GPU "
                     "work now and poll gpuq_start. 'purged': you lost your place; stop.",
      "inputSchema": {"type": "object", "required": ["id"], "properties": dict(
          _ID, **_HOST, progress={"type": "string", "description": "e.g. 41/80"})}},
@@ -87,7 +90,30 @@ TOOLS = [
      "description": "Release the GPU and leave the line. Pass exit_code: non-zero (or ending within 10 "
                     "minutes without one) tells the job's contact.",
      "inputSchema": {"type": "object", "required": ["id"], "properties": dict(
-         _ID, **_HOST, exit_code={"type": "integer", "description": "the job's exit code; 0 = success"})}},
+         _ID, **_HOST, exit_code={"type": "integer", "description": "the job's exit code; 0 = success"},
+         no_notice={"type": "boolean", "description": "tell nobody, however it ended (a deliberate stop)"})}},
+    {"name": "gpuq_edit",
+     "description": "Change a job in line, waiting or running; its id and place are kept. contact \"\" goes back to "
+                    "the owner, log \"\" clears it, desktop false stops desktop notices. gpu moves a waiting job "
+                    "to the end of that card's line; a new priority re-places it.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": dict(
+         _ID, **_HOST, **_JOB, **_PRIORITY,
+         job={"type": "string", "description": "what the job is"},
+         est_min={"type": "integer", "description": "expected minutes of GPU time"},
+         vram_gb={"type": "number", "description": "GPU memory the job needs, GB"},
+         tags={"type": "array", "items": {"type": "string"}, "description": "card tags required"})}},
+    {"name": "gpuq_yield",
+     "description": "Ask the running job to step back, to #2 unless 'to' says otherwise. Its next beat says "
+                    "'yield'; nobody starts until it stops. Use it for your own job, or when your human asks.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": dict(
+         _ID, **_HOST, to={"type": "integer", "description": "position it waits at after (default 2)"})}},
+    {"name": "gpuq_rm",
+     "description": "Remove a job from the line by id (yours, or one your human asked you to). It never kills a "
+                    "process: a running job learns on its next beat ('purged') and should stop.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": dict(_ID, **_HOST)}},
+    {"name": "gpuq_env",
+     "description": "The environment that pins a job to its card (CUDA_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES).",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": dict(_ID, **_HOST)}},
     {"name": "gpuq_inbox",
      "description": "Notices for a contact: jobs that died (exit code, early death), were purged (no "
                     "heartbeat) or stalled, with the log path. Unread ones are marked read.",
@@ -138,8 +164,12 @@ class Server:
             return self._plain(["inventory", "--json"] + (["--hosts", a["hosts"]] if a.get("hosts") else []))
         if name == "gpuq_where":
             return self._plain(["where", "--json"] + self._need(a) +
+                               (["--priority", str(a["priority"])] if a.get("priority") not in (None, "") else []) +
                                (["--hosts", a["hosts"]] if a.get("hosts") else []))
         if name == "gpuq_show":
+            if a.get("hosts") and not host:
+                hs = [h.strip() for h in a["hosts"].split(",") if h.strip()]
+                return {"hosts": {h: self.call("gpuq_show", {"host": h}) for h in hs}}
             rc, out, err = self.run(["show", "--json"], host)
             snap = _json_of(rc, out, err)
             if "lines" in snap:
@@ -150,35 +180,33 @@ class Server:
                                        "vram_gb": e.get("vram_gb"), "progress": e.get("progress")}
                                       for i, e in enumerate(q)] for n, q in snap["lines"].items()}}
             return snap
-        if name == "gpuq_join":
-            spec = {k: a[k] for k in ("owner", "job", "why", "models", "max_min", "important", "gpu", "priority", "level",
-                                      "vram_gb", "tags", "est_min") if a.get(k) not in (None, "", [])}
-            args = ["join", "--json", "--owner", spec.pop("owner"), "--job", spec.pop("job")]
-            for k, flag in (("why", "--why"), ("gpu", "--gpu"), ("max_min", "--max"), ("est_min", "--est"),
-                            ("vram_gb", "--vram")):
-                if k in spec:
-                    args += [flag, str(spec[k])]
-            if spec.get("models"):
-                args += ["--models", ",".join(spec["models"])]
-            for t in spec.get("tags") or []:
-                args += ["--tag", t]
-            if "priority" in spec:
-                args += ["--priority", str(spec["priority"])]
-            elif spec.get("level"):
-                args.append("--" + spec["level"])
-            elif spec.get("important"):
-                args.append("--important")
-            if a.get("contact"):
-                args += ["--contact", a["contact"]]
-            if a.get("desktop"):
-                args.append("--desktop")
-            if a.get("log"):
-                args += ["--log", a["log"]]
+        if name in ("gpuq_join", "gpuq_edit"):
+            editing = name == "gpuq_edit"
+            if editing and not a.get("id"):
+                return {"ok": False, "state": "error", "message": "id is required"}
+            if editing:
+                args = ["edit", a["id"], "--json"]
+            elif not a.get("owner") or not a.get("job"):
+                return {"ok": False, "state": "error", "message": "owner and job are required"}
+            else:
+                args = ["join", "--json", "--owner", a["owner"], "--job", a["job"]]
+            args += self._job_args(a, editing)
             res = _json_of(*self.run(args, host))
-            if res.get("ok"):
-                for c in (a.get("contact") or a["owner"]).split(","):
+            if res.get("ok") and (a.get("contact") or not editing):
+                for c in (a.get("contact") or a.get("owner") or "").split(","):
                     if c.strip():
                         self.watch.add((c.strip(), host))
+            return res
+        if name in ("gpuq_yield", "gpuq_rm", "gpuq_env"):
+            eid = str(a.get("id") or "")
+            if not any(ch.isalpha() for ch in eid):
+                return {"ok": False, "state": "error", "message": "id is required (an id, not a position)"}
+            args = [name[5:], eid, "--json"]
+            if name == "gpuq_yield" and a.get("to") is not None:
+                args.append(str(int(a["to"])))
+            res = _json_of(*self.run(args, host))
+            if name == "gpuq_rm" and res.get("ok"):
+                self.held.pop(eid, None)
             return res
         if name == "gpuq_inbox":
             if not a.get("contact"):
@@ -200,11 +228,13 @@ class Server:
                                                 if verb == "beat" and a.get("progress") else [])
             if verb == "done" and a.get("exit_code") is not None:
                 args.append("--exit=%d" % int(a["exit_code"]))
+            if verb == "done" and a.get("no_notice"):
+                args.append("--no-notice")
             res = _json_of(*self.run(args, host))
             st = res.get("state")
             if verb == "start" and st == "go":
                 self.held[a["id"]] = host
-                res["next"] = "run your GPU work now with env; call gpuq_beat at least every 10 minutes"
+                res["next"] = "run your GPU work now with env; call gpuq_beat about every minute"
             elif verb == "start" and st == "wait":
                 res["next"] = "call gpuq_start again in about 60 seconds"
             elif st == "yield":
@@ -213,6 +243,36 @@ class Server:
                 self.held.pop(a["id"], None)
             return res
         raise KeyError(name)
+
+    def _job_args(self, a, editing=False):
+        """CLI flags for gpuq_join / gpuq_edit fields. On edit, "" clears contact and log."""
+        out = []
+        for k, flag in (("why", "--why"), ("gpu", "--gpu"), ("max_min", "--max"), ("est_min", "--est"),
+                        ("vram_gb", "--vram"), ("job", "--job")):
+            if k == "job" and not editing:
+                continue
+            if a.get(k) not in (None, ""):
+                out += [flag, str(a[k])]
+        if a.get("models"):
+            out += ["--models", ",".join(a["models"])]
+        for t in a.get("tags") or []:
+            out += ["--tag", t]
+        if a.get("priority") not in (None, ""):
+            out += ["--priority", str(a["priority"])]
+        elif a.get("level"):                     # older clients
+            out.append("--" + a["level"])
+        elif a.get("important"):
+            out.append("--important")
+        for k in ("contact", "log"):
+            if a.get(k) or (editing and a.get(k) == ""):
+                out += ["--" + k, a[k]]
+        if a.get("desktop"):
+            out.append("--desktop")
+        elif editing and a.get("desktop") is False:
+            out.append("--no-desktop")
+        if a.get("no_history") and not editing:
+            out.append("--no-history")
+        return out
 
     def _need(self, a):
         out = []

@@ -61,15 +61,24 @@ lacks `~/.local/bin`.
 
 | call | meaning |
 |---|---|
-| `gpuq join ...` | get in line, prints an id. `--vram GB` / `--tag T` pick a card that fits (shortest wait, then the smallest card); `--gpu` names one. `--est` minutes (default: the median of this job's past runs). `--priority chill\|normal\|important\|ablaze\|preempt\|N` (below) `--spec FILE` (or `-` for stdin) reads all of it as one JSON object |
+| `gpuq join ...` | get in line, prints an id. `--vram GB` / `--tag T` pick a card that fits (shortest wait, then the smallest card); `--gpu` names one. `--est MIN` (default: the median of this job's past runs); `--max MIN` (alias `--limit`) is a hard limit, after which the sweep purges it. `--priority chill\|normal\|important\|ablaze\|preempt\|N` (below) `--spec FILE` (or `-` for stdin) reads all of it as one JSON object |
 | `gpuq start ID` | exit 0 = you hold the card. Exit **3** = not your turn yet (or a yield was acknowledged): retry in a minute. Prints `CUDA_VISIBLE_DEVICES=GPU-<uuid>` (or `ROCR_VISIBLE_DEVICES=…`) on multi-card hosts |
-| `gpuq beat ID [--progress 41/80]` | heartbeat, about every 60 s (silent 15 min = purged). Exit **4** = you were purged: stop. Exit **5** = yield: stop your GPU work, go back to polling `start` |
-| `gpuq done ID [--exit CODE]` | finished, leave the line. Give the exit code: a non-zero one tells the job's contact (below). `--quiet` = a deliberate stop, no notice |
-| `gpuq run ID [--free] [--on-stop SH] [--progress-file F] [--log PATH\|-] -- CMD...` | does all of the above, and saves CMD's output to `~/.local/state/gpuq/logs/ID.log` while still showing it (CMD runs on a pseudo-terminal, so progress bars keep working; `--log -` saves nothing). It passes the exit code to `done` and samples the card's memory and load with each beat. On a yield it sends CMD's process group SIGTERM (SIGKILL after `--grace`, default 30 s) and **reruns CMD from the start** when you are #1 again, so CMD must be safe to rerun (checkpoint yourself). `--free` frees the card's residents once granted and restarts what it stopped at the end |
+| `gpuq beat ID [--progress 41/80]` | heartbeat, about every minute (15 min silent = purged). Exit **4** = you were purged: stop. Exit **5** = yield: stop your GPU work, go back to polling `start` |
+| `gpuq done ID [--exit CODE]` | finished, leave the line. Give the exit code: a non-zero one tells the job's contact (below). `--no-notice` = a deliberate stop, no notice |
+| `gpuq run ID [--free] [--on-stop SH] [--progress-file F] [--log PATH\|-] [--every SEC] [--grace SEC] -- CMD...` | does all of the above, and saves CMD's output to `~/.local/state/gpuq/logs/ID.log` while still showing it (CMD runs on a pseudo-terminal, so progress bars keep working; `--log -` saves nothing). It passes the exit code to `done` and samples the card's memory and load with each beat. On a yield it sends CMD's process group SIGTERM (SIGKILL after `--grace`, default 30 s; it beats every `--every`, default 60 s) and **reruns CMD from the start** when you are #1 again, so CMD must be safe to rerun (checkpoint yourself). `--free` frees the card's residents once granted and restarts what it stopped at the end |
 
-Add `--json` to `join`, `start`, `beat`, `done`, `env`, `edit`, `mv`, `yield` or `rm` for one JSON object instead:
-`{"ok", "code", "state", "message", …}` where `state` is `go` / `wait` / `gone` for `start` and `ok` / `yield` /
-`purged` for `beat`. `start --json` carries the pin as `"env": {"CUDA_VISIBLE_DEVICES": "GPU-…"}`.
+Add `--json` to `join`, `start`, `beat`, `done`, `env`, `edit`, `mv`, `yield`, `rm`, `free`, `evac` or `restore` for
+one JSON object instead: `{"ok", "code", "state", "message", …}` where `state` is `go` / `wait` / `gone` for `start`
+and `ok` / `yield` / `purged` for `beat`. `start --json` carries the pin as `"env": {"CUDA_VISIBLE_DEVICES": "GPU-…"}`;
+the resident commands put what they printed in `lines`. On `show`, `inventory`, `where` and `inbox`, `--json` prints
+the data itself, no envelope (`show --json` is one host's: add `--host H` for another).
+
+Exit codes everywhere: 0 ok · 1 failed · 2 bad input · 3 not your turn (or paused) · 4 no such entry (purged,
+removed, done) · 5 yield. `gpuq run` exits with CMD's code.
+
+Flags: `--host H` works before or after the command. Flags are never abbreviated (`--hos` is an error, not
+`--hosts`). List flags (`--models`, `--tag`, `--contact`, `--hosts`) take commas and may repeat. `--card` = `--gpu`.
+`edit` takes an id, never a position.
 
 Hand-rolled holder loop:
 
@@ -101,10 +110,10 @@ A notice holds the job, card, host, exit code, run time and log path. It is a li
 `~/.local/state/gpuq/inbox/<contact>.jsonl` on the host where the job ran; readers pull it:
 
     gpuq inbox --contact NAME [--ack]      # unread notices (--ack marks them read); --hosts a,b for other machines
-    gpuq inbox --contact NAME --follow     # keep printing new ones, e.g. under a session's Monitor
+    gpuq inbox --contact NAME --follow     # keep printing new ones, for a watcher process
 
 The MCP server returns them on the session's next tool call, and the TUI shows them as red ⚠ lines (`a` dismisses
-them from the screen only; each reader keeps its own "read" mark). `join --desktop` also pops a desktop notice
+them from the screen only; each reader keeps its own "read" mark). `join --desktop` (alias `--notify`) also pops a desktop notice
 (`notify-send`) for that job, and an `ntfy` URL in the config sends those to your phone too. Whether a person is told
 is the job owner's choice; `"notify": {"desktop": "always"}` makes it yours.
 
@@ -128,8 +137,9 @@ skipped to the back (twice: removed). A job of at most 6 h goes ahead of jobs wi
     {"mcpServers": {"gpuq": {"command": "gpuq-mcp"}}}
 
 Tools: `gpuq_inventory`, `gpuq_where`, `gpuq_show`, `gpuq_join`, `gpuq_start`, `gpuq_beat`, `gpuq_done`,
-`gpuq_inbox`; each takes an optional `host`. `gpuq_join` takes `contact` and `desktop`, `gpuq_done` takes
-`exit_code`. They return the same states as `--json`, plus a `next` hint for the agent.
+`gpuq_edit`, `gpuq_yield`, `gpuq_rm`, `gpuq_env`, `gpuq_inbox`; each takes an optional `host`. `gpuq_join` and
+`gpuq_edit` take `contact`, `desktop` and `log`; `priority` is a number or a name; `gpuq_done` takes `exit_code`
+and `no_notice`. `gpuq_rm`, `gpuq_yield` and `gpuq_env` take ids only, never positions. They return the same states as `--json`, plus a `next` hint for the agent.
 
 Agents forget to heartbeat, so any tool call also beats every job that MCP session has started, and a pending yield
 for one of them comes back on *any* result as a `notices` entry, as do notices for the contacts of jobs that
