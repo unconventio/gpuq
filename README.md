@@ -87,8 +87,8 @@ Hand-rolled holder loop:
 
 ### When a job dies: notices
 
-A job names a contact with `gpuq join --contact NAME[,NAME]` (default: its owner). The contact gets a notice when
-the job
+A job names a contact with `gpuq join --contact NAME[,NAME]` (default: its owner); `gpuq edit ID --contact …
+--desktop --log …` adds or changes them later, even while it runs. The contact gets a notice when the job
 
 - **fails**: `done --exit` non-zero, or killed by a signal (`gpuq run` reports both);
 - **dies early**: fails, or leaves with no exit code, within 10 minutes of getting the card (unless its own

@@ -1838,6 +1838,11 @@ def main(argv=None):
         p.add_argument(f)
     p.add_argument("--est", type=int)
     p.add_argument("--max", type=int)
+    p.add_argument("--contact", metavar="NAME[,NAME]",
+                   help="who is told if the job dies, is purged or stalls (\"\" = back to the owner)")
+    p.add_argument("--desktop", action=argparse.BooleanOptionalAction, default=None,
+                   help="pop a desktop notice (and ntfy) when that happens, or stop doing so")
+    p.add_argument("--log", metavar="PATH", help="the job's log file, quoted in notices (\"\" = none)")
     p = sub.add_parser("start", help="take the GPU (only as #1)", parents=[jsonp])
     p.add_argument("id")
     p.add_argument("--log", metavar="PATH", help="record the job's log file (gpuq run does)")
@@ -2138,6 +2143,16 @@ def _run(args, now):
                 e["vram_gb"] = args.vram
             if args.tag is not None:
                 e["tags"] = args.tag
+            if args.contact is not None:
+                e["contact"] = [c.strip() for c in args.contact.split(",") if c.strip()]
+                if not e["contact"]:
+                    del e["contact"]
+            if args.desktop is not None:
+                e["desktop"] = args.desktop
+            if args.log is not None:
+                e["log"] = os.path.abspath(os.path.expanduser(args.log))
+                if not args.log:
+                    del e["log"]
             if args.gpu and lines.get(args.gpu) is not q:
                 if e["state"] != "waiting":
                     raise QueueError(2, "%s is %s — it can change cards only while waiting"

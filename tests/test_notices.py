@@ -163,6 +163,29 @@ class Cli(unittest.TestCase):
         self.cli("inbox", "--ack", "--reader", "screen", now=T0 + 3 * MIN)
         self.assertEqual(len(self.inbox("--contact", "painter", now=T0 + 3 * MIN)), 1)
 
+    def test_edit_sets_contact_desktop_and_log_on_a_running_job(self):
+        out = self.dir / "told.txt"
+        self.cfg.write_text(json.dumps({"notify": {"command": "echo {kind} {contact} >> %s" % out}}))
+        jid = self.join()
+        self.cli("start", jid)
+        r = self.cli("edit", jid, "--contact", "artist", "--desktop", "--log", "/tmp/x.log")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.cli("done", jid, "--exit", "1", now=T0 + MIN)
+        got = self.inbox("--contact", "artist", now=T0 + 2 * MIN)
+        self.assertEqual((len(got), got[0]["log"]), (1, "/tmp/x.log"))
+        self.assertEqual(self.inbox("--contact", "painter", now=T0 + 2 * MIN), [])
+        self.assertEqual(out.read_text().split(), ["died", "early", "artist"])
+
+    def test_edit_clears_contact_desktop_and_log(self):
+        jid = self.join("--contact", "artist", "--desktop", "--log", "/tmp/x.log")
+        r = self.cli("edit", jid, "--contact", "", "--no-desktop", "--log", "")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        q = json.loads((self.state / "queue.json").read_text())
+        ent = [x for line in q["lines"].values() for x in line if x["id"] == jid][0]
+        self.assertNotIn("contact", ent)
+        self.assertNotIn("log", ent)
+        self.assertFalse(ent.get("desktop"))
+
     def test_purge_notifies(self):
         jid = self.join()
         self.cli("start", jid)
