@@ -136,6 +136,16 @@ class Who(unittest.TestCase):
         self.assertIn("train.py (pid 9", cli.fleet_checks(views, T0)[0][1])
 
 
+class YieldAlarm(unittest.TestCase):
+    def test_a_fresh_yield_is_not_an_alarm(self):
+        from gpuq import cli
+        y = {"id": "ab12", "owner": "o", "job": "j", "state": "yielding", "yield_since": T0}
+        snap = {"entries": [y], "now": T0 + 60}
+        self.assertFalse(any("yield" in w for w in cli.warnings(snap)))
+        snap["now"] = T0 + 6 * 60
+        self.assertTrue(any(w.startswith("⚠") and "yield" in w for w in cli.warnings(snap)))
+
+
 class Forward(unittest.TestCase):
     def test_host_is_dropped_only_before_the_command_separator(self):
         from gpuq import cli

@@ -324,6 +324,9 @@ def _render_list(snap, views, color):
     return "\n".join(out)
 
 
+YIELD_SLOW_SEC = 5 * 60    # a yield older than this, unacknowledged, needs a human
+
+
 def warnings(snap):
     out = []
     loaded = snap.get("loaded")
@@ -343,8 +346,11 @@ def warnings(snap):
     for m in snap.get("misplaced") or []:
         out.append("⚠ resident on the wrong card: %s" % m)
     for y in yielding(snap["entries"]):
-        out.append("⚠ %s was asked to yield %s ago and hasn't stopped; nobody may start until it does"
-                   % (y["owner"], fmt_dur(snap["now"] - y["yield_since"])))
+        # stepping back takes a beat or two (it hears at its next beat, then stops its work): the
+        # job's own line says "yielding". Only a yield that drags on is worth an alarm.
+        if snap["now"] - y["yield_since"] >= YIELD_SLOW_SEC:
+            out.append("⚠ %s was asked to yield %s ago and hasn't stopped; nobody may start until it does"
+                       % (y["owner"], fmt_dur(snap["now"] - y["yield_since"])))
     if snap.get("foreign_lock"):
         out.append("⚠ lock file held outside gpuq: %s" % " ".join(snap["foreign_lock"].split()))
     return out
