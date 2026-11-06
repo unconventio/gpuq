@@ -107,6 +107,7 @@ def per_card(snap):
         out.append(dict(snap, entries=q, card=name, loaded=None if use is None else use["jobs"],
                         residents=(use or {}).get("residents", []),
                         misplaced=(use or {}).get("misplaced", []),
+                        desktop=(use or {}).get("desktop", []),
                         busy=(use or {}).get("busy")))
     return out
 
@@ -332,6 +333,8 @@ def warnings(snap):
             text += " · busy %d%%" % snap["busy"]
         if snap.get("residents"):
             text += " · residents: %s" % ", ".join(snap["residents"])
+        if snap.get("desktop"):
+            text += " · desktop: %s" % ", ".join(snap["desktop"])
         out.append(text)
         if loaded and not running(snap["entries"]) and not yielding(snap["entries"]):
             out.append("⚠ unqueued GPU use: something holds the GPU but nothing in the queue is running")
@@ -559,11 +562,38 @@ def fleet_alerts(views, now):
         for n in snap.get("notices") or []:
             if snap.get("card") and n.get("gpu") not in (None, snap.get("card")):
                 continue
+            if _is_check(n):
+                continue            # fleet_checks shows these, in yellow
             if any(o[1].endswith("[%s]" % n["id"]) for o in out):
                 continue            # one line per job, its latest notice (they are oldest first)
             out.append((vi, "%s: %s %s %s — %s (%s ago) [%s]" % (
                 name, n.get("owner"), n.get("job", "")[:40], n["kind"], n.get("text", ""),
                 fmt_dur(now - n["t"]), n["id"])))
+    return out
+
+
+def _is_check(n):
+    """A notice worth a look but not an alarm: a job that ended early without an exit code
+    (older wrappers never give one, so a quick normal finish looks the same)."""
+    return n.get("level") == "check" or (n.get("kind") == "died early" and n.get("exit") is None
+                                         and "no exit code" in (n.get("text") or ""))
+
+
+def fleet_checks(views, now):
+    """[(view index, text)]: notices to look at when convenient (yellow, not counted as needing you)."""
+    out = []
+    for vi, (host, snap, err) in enumerate(views):
+        if err or snap is None:
+            continue
+        card, c = _card_of(snap)
+        name = c.get("model") or card or host
+        for n in snap.get("notices") or []:
+            if snap.get("card") and n.get("gpu") not in (None, snap.get("card")):
+                continue
+            if _is_check(n) and not any(o[1].endswith("[%s]" % n["id"]) for o in out):
+                out.append((vi, "%s: %s %s ended after %s, no exit code — check (%s ago) [%s]" % (
+                    name, n.get("owner"), n.get("job", "")[:40], fmt_dur(n.get("ran_sec") or 0),
+                    fmt_dur(now - n["t"]), n["id"])))
     return out
 
 
@@ -677,6 +707,7 @@ def tui_screen(views, sel_host, sel_row, now, width=80):
     L = [(_rule(title, width), "title")]
     L.extend(screen_summary(views, hosts, now, width, sel_host, {vi for vi, _ in alerts}))
     L.extend(("  ⚠ " + _trim(a, width - 6), "alert") for _, a in alerts)
+    L.extend(("  · " + _trim(a, width - 6), "warn") for _, a in fleet_checks(views, now))
     if not (0 <= sel_host < len(views)):
         return L
     host, snap, err = views[sel_host]
@@ -975,7 +1006,8 @@ def flush_outbox():
         title = "gpuq: %s %s" % (n["owner"], n["kind"])
         body = "%s (%s) on %s@%s: %s%s" % (n["job"], n["id"], n.get("gpu") or "?", n["host"], n["text"],
                                            "\nlog: %s" % n["log"] if n.get("log") else "")
-        if (desktop or cfg.get("desktop") == "always") and os.environ.get("GPUQ_DESKTOP") != "0":
+        if (desktop or cfg.get("desktop") == "always") and n.get("level") != "check" \
+                and os.environ.get("GPUQ_DESKTOP") != "0":
             if shutil.which("notify-send"):
                 try:
                     subprocess.run(["notify-send", "-u", "critical", "-a", "gpuq", title, body],
@@ -1069,12 +1101,17 @@ def finish(now, e, code=None, quiet=False):
         bits.append(_peak_text(e))
     note = ", ".join(bits)
     kind = None if quiet else end["kind"]
-    if kind:
+    if kind == "ended early":
+        note += " · no exit code: check"
+    elif kind:
         note += " ⚠ died early" if end["early"] else ""
     log(now, "failed" if kind == "failed" else "done", e, note, exit=code, ran_sec=ran, early=end["early"] or None,
         log=e.get("log"), mem_peak_mib=e.get("mem_peak_mib"), mem_start_mib=e.get("mem_start_mib"),
         util_avg=round(e["util_sum"] / e["util_n"]) if e.get("util_n") else None)
-    if kind:
+    if kind == "ended early":       # no exit code: maybe fine, maybe not — worth a look, not an alarm
+        notify(now, e, "ended early", "ended after %s without an exit code — check the log"
+               % fmt_dur(ran or 0), ran_sec=ran, level="check")
+    elif kind:
         text = _exit_text(code)
         if ran is not None:
             text += " after %s" % fmt_dur(ran)
@@ -1322,6 +1359,14 @@ def _exe(p):
 
 
 GPU_USER_MIN_MIB = 1024  # below this it's desktop apps, whisper, a slicer: not a job
+# Desktop programs that may hold a GB or more (screen recording, remote desktop, the compositor, a
+# browser): shown on the card, never "unqueued use". Config "desktop_apps" adds names.
+DESKTOP_APPS = {"obs", "gnome-shell", "gnome-remote-desktop-daemon", "Xorg", "Xwayland", "kwin_wayland",
+                "kwin_x11", "plasmashell", "mutter", "krfb", "firefox", "chrome", "chromium", "code", "steamwebhelper"}
+
+
+def _desktop_app(proc):
+    return proc in DESKTOP_APPS or proc in (config().get("desktop_apps") or [])
 
 
 def _gpu_proc_name(path):
@@ -1350,7 +1395,7 @@ def gpu_loaded():
             mib = int(mib.strip())
         except ValueError:
             return None
-        if mib >= GPU_USER_MIN_MIB:
+        if mib >= GPU_USER_MIN_MIB and not _desktop_app(_gpu_proc_name(name.strip())):
             out.append("%s %.1fG" % (_gpu_proc_name(name.strip()), mib / 1024))
     return out
 
@@ -1376,7 +1421,7 @@ def card_usage(cards, residents):
         return None
     by_uuid = {c["uuid"]: name for name, c in nv_cards.items()}
     home = {p: card for card, procs in residents.items() for p in procs}
-    use = {name: {"jobs": [], "residents": [], "misplaced": []} for name in nv_cards}
+    use = {name: {"jobs": [], "residents": [], "misplaced": [], "desktop": []} for name in nv_cards}
     for line in r.stdout.splitlines():
         uuid, _, rest = line.partition(",")
         path, _, mib = rest.rpartition(",")
@@ -1392,7 +1437,7 @@ def card_usage(cards, residents):
             use[card]["residents" if home[proc] == card else "misplaced"].append(
                 label if home[proc] == card else "%s is on the %s, meant for the %s" % (proc, card, home[proc]))
         elif mib >= GPU_USER_MIN_MIB:
-            use[card]["jobs"].append(label)
+            use[card]["desktop" if _desktop_app(proc) else "jobs"].append(label)
     for n, u in amd.items():
         use[n] = {"jobs": u["jobs"], "residents": [], "misplaced": [], "busy": u["busy"]}
     if amd:
@@ -1408,7 +1453,9 @@ def _place_residents(use, residents):
         keep = []
         for label in u["jobs"]:
             proc = label.rpartition(" ")[0]
-            if proc in home:
+            if _desktop_app(proc):
+                u.setdefault("desktop", []).append(label)
+            elif proc in home:
                 (u["residents"] if home[proc] == card else u["misplaced"]).append(
                     label if home[proc] == card else
                     "%s is on the %s, meant for the %s" % (proc, card, home[proc]))

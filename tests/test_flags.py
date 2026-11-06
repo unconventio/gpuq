@@ -104,6 +104,17 @@ class Cli(unittest.TestCase):
         self.assertLess(cmds.index("  join "), cmds.index("  show "))
 
 
+class Desktop(unittest.TestCase):
+    def test_desktop_apps_are_not_unqueued_use(self):
+        from gpuq import cli
+        self.assertTrue(cli._desktop_app("obs"))
+        self.assertFalse(cli._desktop_app("python"))
+        snap = {"entries": [], "loaded": [], "desktop": ["obs 1.1G"]}
+        w = cli.warnings(snap)
+        self.assertIn("desktop: obs 1.1G", w[0])
+        self.assertFalse(any("unqueued" in x for x in w))
+
+
 class Forward(unittest.TestCase):
     def test_host_is_dropped_only_before_the_command_separator(self):
         from gpuq import cli

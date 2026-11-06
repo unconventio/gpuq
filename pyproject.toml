@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gpuq"
-version = "0.4.0"
+version = "0.4.1"
 description = "A GPU queue for a few personal machines shared by a human and many AI agents: per-card lines, cooperative yield, fleet-wide placement, MCP."
 readme = "README.md"
 requires-python = ">=3.9"

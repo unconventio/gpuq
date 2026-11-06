@@ -140,7 +140,27 @@ class Cli(unittest.TestCase):
         self.cli("start", jid)
         self.cli("done", jid, now=T0 + MIN)
         got = self.inbox("--contact", "painter", now=T0 + 2 * MIN)
-        self.assertEqual([n["kind"] for n in got], ["died early"])
+        self.assertEqual([(n["kind"], n["level"]) for n in got], [("ended early", "check")])
+        self.assertIn("no exit code", self.history()[-1]["note"])
+
+    def test_check_is_yellow_not_an_alarm(self):
+        from gpuq import cli
+        n = {"t": T0, "id": "ab12", "owner": "o", "job": "j", "kind": "ended early", "level": "check",
+             "text": "x", "ran_sec": 60, "gpu": None}
+        snap = {"host": "h", "entries": [], "lines": {}, "notices": [n]}
+        views = [("h", snap, None)]
+        self.assertEqual(cli.fleet_alerts(views, T0 + 60), [])
+        self.assertIn("check", cli.fleet_checks(views, T0 + 60)[0][1])
+        old = dict(n, kind="died early", level=None, text="no exit code given after 1m")   # 0.3 notices
+        self.assertTrue(cli._is_check(old))
+
+    def test_desktop_job_gets_no_popup_for_a_check(self):
+        out = self.dir / "told.txt"
+        self.cfg.write_text(json.dumps({"notify": {"command": "echo {kind} >> %s" % out}}))
+        jid = self.join("--desktop")
+        self.cli("start", jid)
+        self.cli("done", jid, now=T0 + MIN)
+        self.assertEqual(out.read_text().split(), ["ended", "early"])      # the command still runs
 
     def test_success_and_quiet_are_silent(self):
         a = self.join("--est", "1")
