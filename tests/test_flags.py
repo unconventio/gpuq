@@ -115,6 +115,27 @@ class Desktop(unittest.TestCase):
         self.assertFalse(any("unqueued" in x for x in w))
 
 
+class Who(unittest.TestCase):
+    def test_describe_this_process(self):
+        from gpuq import cli
+        d = cli.describe_pid(os.getpid())
+        self.assertIn("pid %d" % os.getpid(), d)
+        self.assertEqual(cli.describe_pid(2 ** 22 + 7), "")        # gone: nothing
+
+    def test_short_command(self):
+        from gpuq import cli
+        self.assertEqual(cli._short_cmd(["/v/bin/python3", "-u", "/x/y/train.py", "--lr", "1"]), "python3 train.py --lr 1")
+        self.assertEqual(cli._short_cmd(["python", "-m", "vllm.entrypoints", "serve"]), "python -m vllm.entrypoints serve")
+
+    def test_unqueued_use_is_a_yellow_check_naming_the_process(self):
+        from gpuq import cli
+        snap = {"host": "h", "entries": [], "lines": {}, "loaded": ["python 2.0G"],
+                "who": {"python 2.0G": "python train.py (pid 9, alice, 2h, in tmux, ~/x)"}}
+        views = [("h", snap, None)]
+        self.assertEqual(cli.fleet_alerts(views, T0), [])
+        self.assertIn("train.py (pid 9", cli.fleet_checks(views, T0)[0][1])
+
+
 class Forward(unittest.TestCase):
     def test_host_is_dropped_only_before_the_command_separator(self):
         from gpuq import cli

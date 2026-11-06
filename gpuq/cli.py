@@ -337,7 +337,9 @@ def warnings(snap):
             text += " · desktop: %s" % ", ".join(snap["desktop"])
         out.append(text)
         if loaded and not running(snap["entries"]) and not yielding(snap["entries"]):
-            out.append("⚠ unqueued GPU use: something holds the GPU but nothing in the queue is running")
+            who = snap.get("who") or {}
+            out.append("· unqueued GPU use, nothing in the queue is running: %s"
+                       % "; ".join(who.get(l, l) for l in loaded))
     for m in snap.get("misplaced") or []:
         out.append("⚠ resident on the wrong card: %s" % m)
     for y in yielding(snap["entries"]):
@@ -580,13 +582,17 @@ def _is_check(n):
 
 
 def fleet_checks(views, now):
-    """[(view index, text)]: notices to look at when convenient (yellow, not counted as needing you)."""
+    """[(view index, text)]: things to look at when convenient (yellow, not counted as needing you):
+    GPU use outside the queue, and jobs that ended early without an exit code."""
     out = []
     for vi, (host, snap, err) in enumerate(views):
         if err or snap is None:
             continue
         card, c = _card_of(snap)
         name = c.get("model") or card or host
+        for w in warnings(snap):
+            if w.startswith("· "):
+                out.append((vi, "%s: %s" % (name, w[2:])))
         for n in snap.get("notices") or []:
             if snap.get("card") and n.get("gpu") not in (None, snap.get("card")):
                 continue
@@ -1295,7 +1301,7 @@ def amd_usage(cards):
     if not amd:
         return {}
     by_pci = {c["pci"]: n for n, c in amd.items() if c.get("pci")}
-    seen, per = set(), {n: {} for n in amd}
+    seen, per, first = set(), {n: {} for n in amd}, {}
     try:
         # lowest pid first: forked children (PyTorch data-loader workers) inherit their parent's
         # DRM file, and the parent is the one to name
@@ -1333,10 +1339,13 @@ def amd_usage(cards):
             if amd[card]["integrated"] or kib:
                 name = _gpu_proc_name(_exe(p) or _read(p / "comm") or p.name)
                 per[card][name] = per[card].get(name, 0) + kib
+                first.setdefault((card, name), p.name)
     use = {}
     for n, c in amd.items():
         jobs = ["%s %.1fG" % (proc, kib / (1 << 20)) for proc, kib in sorted(per[n].items(), key=lambda x: -x[1])
                 if kib >= GPU_USER_MIN_MIB * 1024]
+        for j in jobs:
+            _note_who(j, first.get((n, j.rpartition(" ")[0])))
         busy = _read(SYSFS / "class" / "drm" / _card_dir(c) / "device" / "gpu_busy_percent")
         use[n] = {"jobs": jobs, "busy": int(busy) if busy.isdigit() else None}
     return use
@@ -1365,6 +1374,151 @@ DESKTOP_APPS = {"obs", "gnome-shell", "gnome-remote-desktop-daemon", "Xorg", "Xw
                 "kwin_x11", "plasmashell", "mutter", "krfb", "firefox", "chrome", "chromium", "code", "steamwebhelper"}
 
 
+# ---- who is behind a GPU process: command, user, age, and how it was started (from /proc) ----
+
+_WHO = {}       # label -> description, filled while a snapshot reads the cards
+
+SHELLS = {"bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu", "xonsh", "env", "nohup", "setsid",
+          "timeout", "sudo", "systemd-run", "script", "stdbuf", "nice", "ionice", "taskset", "time"}
+TERMINALS = {"gnome-terminal-", "gnome-terminal-server", "konsole", "kitty", "alacritty", "ptyxis", "ptyxis-agent",
+             "xterm", "wezterm-gui", "foot", "tilix", "terminator", "xfce4-terminal", "yakuake", "kgx", "guake"}
+
+
+def _note_who(label, pid):
+    try:
+        d = describe_pid(int(str(pid).strip()))
+    except (TypeError, ValueError):
+        return
+    if d and label not in _WHO:
+        _WHO[label] = d
+
+
+def _stat(pid):
+    """(comm, ppid, start ticks, uid) from /proc/PID, or None."""
+    try:
+        raw = (PROC / str(pid) / "stat").read_text()
+        comm = raw[raw.index("(") + 1:raw.rindex(")")]
+        f = raw[raw.rindex(")") + 2:].split()
+        return comm, int(f[1]), int(f[19]), (PROC / str(pid)).stat().st_uid
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _cmdline(pid):
+    try:
+        return [a for a in (PROC / str(pid) / "cmdline").read_bytes().decode(errors="replace").split("\0") if a]
+    except OSError:
+        return []
+
+
+def _short_cmd(argv):
+    """`python -u /x/train.py --a b` -> "python train.py --a b" (trimmed)."""
+    if not argv:
+        return "?"
+    words = [os.path.basename(argv[0])]
+    rest = argv[1:]
+    if words[0].startswith("python") and rest:
+        rest = [a for a in rest if a not in ("-u", "-O", "-B")]
+        if rest and rest[0] == "-m" and len(rest) > 1:
+            words, rest = [words[0], "-m", rest[1]], rest[2:]
+        elif rest:
+            words, rest = [words[0], os.path.basename(rest[0])], rest[1:]
+    text = " ".join(words + [os.path.basename(a) if a.startswith("/") else a for a in rest])
+    return text if len(text) <= 48 else text[:47] + "…"
+
+
+def _origin(pid):
+    """How PID was started, from its ancestors and cgroup: "a VS Code terminal", "tmux",
+    "a Claude Code session, in tmux", "service ollama", "a container", "ssh"... or ""."""
+    try:
+        cg = (PROC / str(pid) / "cgroup").read_text()
+    except OSError:
+        cg = ""
+    if any(m in cg for m in ("libpod-", "/docker", "docker-", "containerd", "/lxc")):
+        return "a container"
+    found, cur, parent = [], pid, None
+    for _ in range(40):
+        st = _stat(cur)
+        if not st or st[1] <= 1:
+            break
+        cur = st[1]
+        pst = _stat(cur)
+        if not pst:
+            break
+        comm, argv = pst[0], _cmdline(cur)
+        joined = " ".join(argv[:3])
+        what = None
+        if comm == "claude" or "claude" in os.path.basename(argv[0] if argv else ""):
+            what = "a Claude Code session"
+        elif any(os.path.basename(a) in ("gpuq", "gpuq-launch") or a == "gpuq" and argv[i - 1:i] == ["-m"]
+                 for i, a in enumerate(argv[:3])) and "run" in argv[1:4]:
+            what = "gpuq run"
+        elif comm.startswith("tmux"):
+            what = "tmux"
+        elif comm.lower() == "screen":
+            what = "screen"
+        elif comm == "sshd" or comm.startswith("sshd-"):
+            what = "ssh"
+        elif comm in ("code", "codium") or "/code/" in (argv[0] if argv else "") and "electron" in joined:
+            what = "a VS Code terminal"
+        elif comm in TERMINALS or comm.startswith("gnome-terminal"):
+            what = "a terminal (%s)" % comm.rstrip("-")
+        elif comm == "systemd":
+            break
+        if parent is None and not what and comm not in SHELLS:
+            parent = _short_cmd(argv)[:32] if argv else comm   # the nearest launcher that isn't a shell
+        if what and what not in found:
+            found.append(what)
+        if len(found) == 2:
+            break
+    unit = ""
+    for line in cg.splitlines():
+        last = line.rpartition("/")[2]
+        if last.endswith(".service") and not last.startswith(("user@", "session-")):
+            unit = last[:-len(".service")]
+    scope = cg.rpartition("/")[2].strip()
+    for prefix, what in (("tmux-spawn-", "tmux"), ("vte-spawn-", "a terminal"), ("app-gnome-code", "a VS Code terminal"),
+                         ("app-code", "a VS Code terminal"), ("app-org.kde.konsole", "a terminal (konsole)")):
+        if scope.startswith(prefix) and what not in found:
+            found.append(what)
+    if parent and parent.split()[0] != os.path.basename((_cmdline(pid) or [""])[0]):
+        found.insert(0, "under %s" % parent)
+    if not found and unit:
+        return "service %s" % unit
+    if not found and ".scope" in cg and "app-" in cg:
+        return "a desktop app"
+    return ", in ".join(found)
+
+
+def describe_pid(pid, now=None):
+    """'python train.py (pid 4123, alice, 2h10, a VS Code terminal, ~/code/x)', or "" if PID is gone."""
+    st = _stat(pid)
+    if not st:
+        return ""
+    bits = ["pid %d" % pid]
+    try:
+        import pwd
+        bits.append(pwd.getpwuid(st[3]).pw_name)
+    except (KeyError, ImportError):
+        bits.append("uid %d" % st[3])
+    try:
+        btime = next(int(l.split()[1]) for l in (PROC / "stat").read_text().splitlines() if l.startswith("btime"))
+        started = btime + st[2] / os.sysconf("SC_CLK_TCK")
+        bits.append(fmt_dur((now or time.time()) - started))
+    except (OSError, StopIteration, ValueError):
+        pass
+    origin = _origin(pid)
+    if origin:
+        bits.append(origin)
+    try:
+        cwd = os.readlink(PROC / str(pid) / "cwd")
+        home = os.path.expanduser("~")
+        bits.append("~" + cwd[len(home):] if cwd.startswith(home) else cwd)
+    except OSError:
+        pass
+    return "%s (%s)" % (_short_cmd(_cmdline(pid)), ", ".join(bits))
+
+
 def _desktop_app(proc):
     return proc in DESKTOP_APPS or proc in (config().get("desktop_apps") or [])
 
@@ -1382,7 +1536,7 @@ def gpu_loaded():
     Not `ollama ps`: that only sees one server and says "nothing" while other jobs hold the card.
     Better to not know what is loaded than to be told nothing is when something is."""
     try:
-        r = subprocess.run(["nvidia-smi", "--query-compute-apps=process_name,used_memory",
+        r = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
                             "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -1390,13 +1544,15 @@ def gpu_loaded():
         return None
     out = []
     for line in r.stdout.splitlines():
-        name, _, mib = line.rpartition(",")
+        pid, _, rest = line.partition(",")
+        name, _, mib = rest.rpartition(",")
         try:
             mib = int(mib.strip())
         except ValueError:
             return None
         if mib >= GPU_USER_MIN_MIB and not _desktop_app(_gpu_proc_name(name.strip())):
             out.append("%s %.1fG" % (_gpu_proc_name(name.strip()), mib / 1024))
+            _note_who(out[-1], pid)
     return out
 
 
@@ -1413,7 +1569,7 @@ def card_usage(cards, residents):
         _place_residents(use, residents)
         return use
     try:
-        r = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,process_name,used_memory",
+        r = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
                             "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -1424,6 +1580,7 @@ def card_usage(cards, residents):
     use = {name: {"jobs": [], "residents": [], "misplaced": [], "desktop": []} for name in nv_cards}
     for line in r.stdout.splitlines():
         uuid, _, rest = line.partition(",")
+        pid, _, rest = rest.partition(",")
         path, _, mib = rest.rpartition(",")
         try:
             mib = int(mib.strip())
@@ -1438,6 +1595,7 @@ def card_usage(cards, residents):
                 label if home[proc] == card else "%s is on the %s, meant for the %s" % (proc, card, home[proc]))
         elif mib >= GPU_USER_MIN_MIB:
             use[card]["desktop" if _desktop_app(proc) else "jobs"].append(label)
+            _note_who(label, pid)
     for n, u in amd.items():
         use[n] = {"jobs": u["jobs"], "residents": [], "misplaced": [], "busy": u["busy"]}
     if amd:
@@ -1496,6 +1654,7 @@ def card_meters(cards):
 def local_snapshot(now):
     with store(write=False) as Q:
         lines, cards = Q["lines"], Q["cards"]
+        _WHO.clear()
         use = card_usage(cards, fleet.resident_names(config()))
         has_amd = any(c.get("vendor") == "amd" for c in cards.values())
         if use is None or (len(cards) < 2 and not has_amd):
@@ -1505,6 +1664,7 @@ def local_snapshot(now):
         snap = snapshot(lines[Q["default"]], now, history(), loaded, paused=paused_state(),
                         lines=lines, cards=cards, card_use=use, default=Q["default"], evac=read_evac())
         snap["meters"] = card_meters(cards)
+        snap["who"] = dict(_WHO)        # label -> "python train.py (pid 4123, alice, 2h10, in tmux, ~/x)"
         snap["notices"] = notices(now)      # unread by the screen: the TUI shows them as alerts
         if use and len(use) == 1:       # one card: per_card() leaves the snapshot alone, so carry busy here
             snap["busy"] = next(iter(use.values())).get("busy")

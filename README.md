@@ -206,6 +206,11 @@ Each card has its own line, named by model number. NVIDIA jobs get their card by
 `inventory`, `where` and `tui --hosts a,b` reach others over SSH (key auth, gpuq installed there). `where` suggests
 a host; nothing places jobs across hosts for you.
 
+GPU use outside the queue is shown as a yellow line naming each process: its command, pid, user, age, how it was
+started (a service, a container, tmux or screen, a terminal, VS Code, ssh, a Claude Code session) and its folder,
+read from /proc. Desktop programs (OBS, remote desktop, browsers, the compositor; config `desktop_apps` adds more) are
+listed as `desktop:` and never count. A job that ends early without an exit code is a yellow "check", not a red alarm.
+
 ### AMD and integrated GPUs
 
 AMD cards are found in `/sys/class/drm` (driver `amdgpu`) and named from the PCI id database (`Radeon 880M` -> `880M`);
