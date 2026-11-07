@@ -146,6 +146,18 @@ class YieldAlarm(unittest.TestCase):
         self.assertTrue(any(w.startswith("⚠") and "yield" in w for w in cli.warnings(snap)))
 
 
+class Completion(Cli):
+    def test_completes_verbs_flags_cards_and_ids(self):
+        jid = self.join()
+        out = lambda *w: self.cli("__complete", *w).stdout.split()
+        self.assertIn("show", out(""))
+        self.assertIn("--priority", out("join", "--p"))
+        self.assertEqual(out("join", "--gpu", ""), ["gpu"])
+        self.assertEqual(out("done", ""), [jid])
+        self.assertEqual(out("run", "x", "--log", ""), ["__files__"])
+        self.assertIn("complete -F _gpuq gpuq", self.cli("completion", "bash").stdout)
+
+
 class Forward(unittest.TestCase):
     def test_host_is_dropped_only_before_the_command_separator(self):
         from gpuq import cli

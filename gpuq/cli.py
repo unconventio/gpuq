@@ -2010,6 +2010,80 @@ EPILOG = """exit codes:
 `gpuq COMMAND --help` for a command's flags. Flags that take a list accept commas and may repeat."""
 
 
+COMPLETION_BASH = r"""# gpuq bash completion: `gpuq completion bash > ~/.local/share/bash-completion/completions/gpuq`
+_gpuq() {
+    local cur=${COMP_WORDS[COMP_CWORD]} i out
+    for ((i = 1; i < COMP_CWORD; i++)); do          # after `--` it is gpuq run's command: complete as usual
+        [[ ${COMP_WORDS[i]} == -- ]] && { compopt -o default; COMPREPLY=(); return; }
+    done
+    out=$("${COMP_WORDS[0]}" __complete "${COMP_WORDS[@]:1:COMP_CWORD}" 2>/dev/null)
+    if [[ $out == __files__ ]]; then compopt -o default; COMPREPLY=(); return; fi
+    mapfile -t COMPREPLY < <(compgen -W "$out" -- "$cur")
+}
+complete -F _gpuq gpuq"""
+
+CARD_OPTS = {"--gpu", "--card", "--to"}
+FILE_OPTS = {"--log", "--spec", "--progress-file"}
+
+
+def _complete(ap, words):
+    """Candidates for the last of WORDS (the words after `gpuq`, the last one being typed)."""
+    cur, before = (words or [""])[-1], words[:-1]
+    prev = before[-1] if before else ""
+    verbs = next(a for a in ap._actions if isinstance(a, argparse._SubParsersAction)).choices
+    verb, skip = None, False
+    for w in before:
+        if skip:
+            skip = False
+        elif w == "--host":
+            skip = True
+        elif not w.startswith("-") and w in verbs:
+            verb = w
+            break
+    parser = verbs[verb] if verb else ap
+    opt = next((a for a in parser._actions if prev in a.option_strings), None)
+    if opt is not None and opt.nargs != 0 and not isinstance(opt, (argparse._StoreTrueAction,
+                                                                     argparse._StoreConstAction,
+                                                                     argparse.BooleanOptionalAction)):
+        if prev in FILE_OPTS:
+            return ["__files__"]
+        if prev in CARD_OPTS:
+            return _card_names()
+        if prev in ("--host", "--hosts"):
+            hosts = [h for h in (config().get("hosts") or HOST).split(",") if h]
+            head = cur.rpartition(",")[0] + "," if prev == "--hosts" and "," in cur else ""
+            return [head + h for h in hosts]
+        if prev == "--priority":
+            return list(PRIORITY) + ["preempt"]
+        return list(opt.choices or [])
+    if cur.startswith("-"):
+        return sorted(o for a in parser._actions for o in a.option_strings if o.startswith("--"))
+    if verb is None:
+        return list(verbs)
+    taken = sum(1 for w in before[before.index(verb) + 1:] if not w.startswith("-"))
+    if verb in ("start", "beat", "done", "edit", "env", "yield", "run", "mv", "rm") and taken == 0:
+        return _queue_ids()
+    if verb in ("free", "evac", "restore") and taken == 0:
+        return _card_names()
+    return []
+
+
+def _card_names():
+    try:
+        with store(write=False) as Q:
+            return sorted(Q["cards"] or Q["lines"])
+    except Exception:       # noqa: BLE001
+        return []
+
+
+def _queue_ids():
+    try:
+        with store(write=False) as Q:
+            return [e["id"] for q in Q["lines"].values() for e in q]
+    except Exception:       # noqa: BLE001
+        return []
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     apply_rules(config())
@@ -2184,9 +2258,21 @@ def main(argv=None):
     p.add_argument("--print", "--dry-run", dest="print", action="store_true", help="print it; write nothing")
     p.add_argument("--force", action="store_true", help="replace an existing config (kept as .bak)")
     cmd_parser("mcp", "serve the queue to AI agents over MCP (stdio)")
+    p = cmd_parser("completion", "print the shell completion script: Tab completes commands, flags, cards, hosts, ids",
+                   description="Tab completion for bash. Install it once:\n\n"
+                               "  mkdir -p ~/.local/share/bash-completion/completions\n"
+                               "  gpuq completion bash > ~/.local/share/bash-completion/completions/gpuq\n\n"
+                               "then open a new shell.", formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("shell", nargs="?", default="bash", choices=["bash"], help="only bash, for now")
     # -- Timer --
     cmd_parser("sweep", "garbage collection: purge silent or over-limit jobs, skip no-shows, report stalls"
                " (the timer runs this every minute)")
+    if argv[:1] == ["__complete"]:            # called by the completion script on Tab
+        try:
+            print("\n".join(_complete(ap, argv[1:])))
+        except Exception:                     # noqa: BLE001 (Tab must never print a traceback)
+            pass
+        return 0
     # everything after the first "--" is gpuq run's command, never gpuq's own options
     head, run_cmd = (argv[:argv.index("--")], argv[argv.index("--") + 1:]) if "--" in argv else (argv, [])
     args = ap.parse_args(head)
@@ -2286,6 +2372,9 @@ def _run(args, now):
         return _inventory(args, now)
     if cmd == "where":
         return _where(args, now)
+    if cmd == "completion":
+        print(COMPLETION_BASH)
+        return 0
     if cmd == "init":
         return _init(args, now)
     if cmd == "mcp":

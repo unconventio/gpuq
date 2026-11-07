@@ -48,6 +48,11 @@ Some terminals (Ptyxis, for one) can't set a window size per launch, only a defa
 use another terminal for the launcher, or change that default. Use the full path to `gpuq` if the menu's PATH
 lacks `~/.local/bin`.
 
+Tab completion for bash (commands, flags, card names, hosts, queue ids):
+
+    mkdir -p ~/.local/share/bash-completion/completions
+    gpuq completion bash > ~/.local/share/bash-completion/completions/gpuq
+
 ## Quickstart
 
     gpuq where --vram 16                 # which card, on which machine, how soon
