@@ -1,0 +1,8 @@
+/* gpuq top-bar indicator: an icon whose colour is the state. Red is left to other meters. */
+.system-status-icon.gpuq-icon { icon-size: 26px; padding: 0 2px; }
+.gpuq-icon.gpuq-unqueued { color: #f5a623; }
+.gpuq-icon.gpuq-paused, .gpuq-icon.gpuq-unknown { color: #9a9996; }
+.gpuq-host { font-weight: bold; }
+.gpuq-card { font-weight: bold; }
+.gpuq-dim { color: #9a9996; }
+.gpuq-amber { color: #f5a623; }

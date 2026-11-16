@@ -1,0 +1,8 @@
+{
+  "uuid": "gpuq@unconventio",
+  "name": "gpuq",
+  "description": "Top-bar view of the gpuq GPU queue: who is running on each card, how many wait, unqueued GPU use. Read-only; reads `gpuq show --json` (this host every 12 s, other hosts over ssh every 60 s).",
+  "shell-version": ["48", "49", "50"],
+  "version": 1,
+  "url": "https://codeberg.org/unconventio/gpuq"
+}

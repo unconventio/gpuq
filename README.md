@@ -248,6 +248,11 @@ Linux only. Purging a holder removes its place; it does not kill its process. Th
 are found by `gpuq sweep`, so install its timer (`examples/`) on every host. Logs and notices are never deleted by
 gpuq.
 
+## Experimental: a GNOME top-bar indicator
+
+`gnome/` holds a GNOME Shell extension that shows the queue in the top bar. It is off by default; see
+[gnome/README.md](gnome/README.md).
+
 ## Tests
 
     python3 -m unittest discover -s tests
