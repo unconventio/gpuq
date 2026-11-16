@@ -2486,13 +2486,13 @@ def _run(args, now):
                 log(now, "started", e, "adopted a live job" if args.adopt else where(q).strip())
             pin = card_env(Q, args.id)
             res.update(id=e["id"], gpu=e.get("gpu") or Q["default"],
-                       env=dict([pin.split("=", 1)]) if pin else {})
+                       env=pin_env(pin))
             if multi and pin and not as_json:
                 print(pin)
         elif cmd == "env":
             line_of(args.id, by_id=True)
             pin = card_env(Q, args.id)
-            res["env"] = dict([pin.split("=", 1)]) if pin else {}
+            res["env"] = pin_env(pin)
             if not as_json:
                 print(pin or "")
         elif cmd == "edit":
@@ -2661,6 +2661,20 @@ def card_env(Q, eid):
     return None
 
 
+# Vulkan ignores CUDA_VISIBLE_DEVICES: Ollama (and any ggml build with a Vulkan backend) enumerates every
+# card through it and can load a CUDA-pinned job onto the other card. A CUDA pin therefore also turns ggml's
+# Vulkan devices off, so the job stays on its card through CUDA. ROCm pins are left alone.
+VULKAN_OFF = {"GGML_VK_VISIBLE_DEVICES": "-1", "OLLAMA_VULKAN": "0"}
+
+
+def pin_env(pin):
+    """The env dict for a card_env() pin: the pin itself, plus VULKAN_OFF for a CUDA pin."""
+    if not pin:
+        return {}
+    k, _, v = pin.partition("=")
+    return dict({k: v}, **(VULKAN_OFF if k == "CUDA_VISIBLE_DEVICES" else {}))
+
+
 def _hold(args):
     """gpuq run: hold the GPU for a command — start, beat, yield, resume, done."""
     cmd = args.run_cmd
@@ -2794,7 +2808,7 @@ def _hold(args):
                 _, stopped = free_card(mine, config(), say=lambda t: say(t.strip()))
                 freed.extend(u for u in stopped if u not in freed)
             if pin:
-                env[pin.partition("=")[0]] = pin.partition("=")[2]
+                env.update(pin_env(pin))
             say("granted%s, running: %s" % (" (%s)" % pin if pin else "", shlex.join(cmd)))
             proc = launch(env)
             while True:

@@ -152,7 +152,7 @@ class CLI(unittest.TestCase):
     def test_json_states_for_start_and_beat(self):
         a, _ = self.js("join", "--owner", "a", "--job", "long", "--est", "600", "--gpu", "3090", "--json")
         st, _ = self.js("start", a["id"], "--json")
-        self.assertEqual((st["state"], st["env"]), ("go", {"CUDA_VISIBLE_DEVICES": "GPU-aaaa"}))
+        self.assertEqual((st["state"], st["env"]), ("go", {"CUDA_VISIBLE_DEVICES": "GPU-aaaa", "GGML_VK_VISIBLE_DEVICES": "-1", "OLLAMA_VULKAN": "0"}))
         b, _ = self.js("join", "--owner", "b", "--job", "short", "--est", "10", "--gpu", "3090", "--json", now=T0 + 60)
         self.assertTrue(b["jumped"])
         st, r = self.js("start", b["id"], "--json", now=T0 + 61)
@@ -312,7 +312,7 @@ class MCP(unittest.TestCase):
         a = self.call("gpuq_join", owner="agent-a", job="train", est_min=600, vram_gb=16)
         self.assertEqual(a["gpu"], "3090")
         st = self.call("gpuq_start", id=a["id"])
-        self.assertEqual((st["state"], st["env"]), ("go", {"CUDA_VISIBLE_DEVICES": "GPU-aaaa"}))
+        self.assertEqual((st["state"], st["env"]), ("go", {"CUDA_VISIBLE_DEVICES": "GPU-aaaa", "GGML_VK_VISIBLE_DEVICES": "-1", "OLLAMA_VULKAN": "0"}))
         self.now[0] += 60
         b = self.call("gpuq_join", owner="agent-b", job="quick", est_min=5, gpu="3090")
         # agent A's session makes an unrelated call: its held job is beaten and the yield surfaces

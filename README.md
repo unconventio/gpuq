@@ -207,7 +207,9 @@ Optional JSON at `~/.config/gpuq/config.json` (`$GPUQ_CONFIG`); `gpuq init` writ
 ## Cards and hosts
 
 Each card has its own line, named by model number. NVIDIA jobs get their card by UUID in `CUDA_VISIBLE_DEVICES`
-(nvidia-smi and CUDA number cards differently). Every host keeps its own queue; `gpuq --host H cmd`, `show`, `watch`,
+(nvidia-smi and CUDA number cards differently). Vulkan ignores that variable, so `gpuq run` and the `--json`/MCP env
+also set `GGML_VK_VISIBLE_DEVICES=-1` and `OLLAMA_VULKAN=0`: Ollama and llama.cpp then stay on the card through CUDA
+(ROCm pins are left alone). If you use the plain `gpuq env` line, set those two yourself. Every host keeps its own queue; `gpuq --host H cmd`, `show`, `watch`,
 `inventory`, `where` and `tui --hosts a,b` reach others over SSH (key auth, gpuq installed there). `where` suggests
 a host; nothing places jobs across hosts for you.
 

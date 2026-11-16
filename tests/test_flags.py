@@ -210,3 +210,18 @@ class Mcp(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PinEnv(unittest.TestCase):
+    """A CUDA pin also turns ggml's Vulkan devices off (Ollama loaded onto the other card through Vulkan)."""
+
+    def test_cuda_pin_turns_vulkan_off(self):
+        from gpuq.cli import pin_env
+        env = pin_env("CUDA_VISIBLE_DEVICES=GPU-abc")
+        self.assertEqual(env, {"CUDA_VISIBLE_DEVICES": "GPU-abc", "GGML_VK_VISIBLE_DEVICES": "-1",
+                               "OLLAMA_VULKAN": "0"})
+
+    def test_rocm_pin_and_none(self):
+        from gpuq.cli import pin_env
+        self.assertEqual(pin_env("ROCR_VISIBLE_DEVICES=1"), {"ROCR_VISIBLE_DEVICES": "1"})
+        self.assertEqual(pin_env(None), {})
