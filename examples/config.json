@@ -17,5 +17,6 @@
   "units": {"whisper-server": "whisper.service"},
   "hosts": "workstation,laptop",
   "remote_command": "~/.local/bin/gpuq",
-  "compat_lock": "~/GPU-LOCK.txt"
+  "compat_lock": "~/GPU-LOCK.txt",
+  "vram_temp_files": {"3090": "/run/gpuq/vram-temp-3090"}
 }

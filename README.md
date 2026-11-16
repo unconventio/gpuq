@@ -203,6 +203,14 @@ Optional JSON at `~/.config/gpuq/config.json` (`$GPUQ_CONFIG`); `gpuq init` writ
 | `rules` | `{"jump_ratio": 10, "jump_max_hours": 6, "priorities": {"chill": 5, "normal": 10, "important": 20, "ablaze": 30}, "early_death_min": 10, "stall_min": 30}` |
 | `notify` | `{"desktop": "never"\|"always", "ntfy": URL, "command": SHELL}`: how notices leave the inbox. `command` gets `{id} {kind} {owner} {job} {exit} {log} {contact} {text}`, shell-quoted |
 | `compat_lock` | a lock file for older tools; written while a job runs, removed after |
+| `vram_temp_files` | `{card: path}`: a file holding the card's memory temperature as a whole °C, shown beside the core temperature (TUI TEMP column, `meters.vram_temp_c`). Default `/run/gpuq/vram-temp-<card>` if it exists |
+
+Card temperatures come from nvidia-smi (NVIDIA) or hwmon (AMD) and turn yellow at 83 °C core or 100 °C memory.
+GeForce cards don't report memory (GDDR6X junction) temperature through nvidia-smi; gpuq never reads it from the
+hardware itself, it only reads a file that something else writes. One way is the
+[gddr6](https://github.com/olealgoritme/gddr6) tool run as a root service writing the number to a file. It reads
+card registers through `/dev/mem`, which most kernels only allow when booted with `iomem=relaxed` — a system-wide
+loosening of a memory protection, so weigh that before turning it on.
 
 ## Cards and hosts
 

@@ -1660,9 +1660,11 @@ def card_meters(cards):
         except (OSError, ValueError, subprocess.TimeoutExpired):
             pass
     # GeForce cards don't report their memory (GDDR6X junction) temperature through nvidia-smi. A root
-    # helper may write it, in whole °C, to /run/gpuq/vram-temp-<card>; gpuq only reads that file.
+    # helper (e.g. the gddr6 tool) may write it in whole °C to a file; gpuq only reads it. Which file:
+    # config "vram_temp_files" {card: path}, else /run/gpuq/vram-temp-<card>.
+    files = config().get("vram_temp_files") or {}
     for n in cards:
-        t = _read(VRAM_TEMP_DIR / ("vram-temp-%s" % n)).strip()
+        t = _read(files.get(n) or VRAM_TEMP_DIR / ("vram-temp-%s" % n)).strip()
         if t.isdigit():
             out.setdefault(n, {})["vram_temp_c"] = int(t)
     for n, c in cards.items():
