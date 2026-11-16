@@ -225,3 +225,18 @@ class PinEnv(unittest.TestCase):
         from gpuq.cli import pin_env
         self.assertEqual(pin_env("ROCR_VISIBLE_DEVICES=1"), {"ROCR_VISIBLE_DEVICES": "1"})
         self.assertEqual(pin_env(None), {})
+
+
+class Temps(unittest.TestCase):
+    """Card temperatures: the TEMP column shows core °C, plus memory junction °C when a helper writes it."""
+
+    def test_temp_column_and_vram(self):
+        from gpuq import cli
+        snap = {"entries": [], "card": "3090", "paused": None}
+        views = [("workstation", dict(snap, cards={"3090": {"model": "RTX 3090", "mib": 24576}},
+                               meters={"3090": {"used_mib": 1024, "util": 5, "temp_c": 85, "vram_temp_c": 96}}), None)]
+        out = cli.screen_summary(views, ["workstation"], 0, 160, 0)
+        self.assertIn("TEMP", out[0][0])
+        row = out[1]
+        self.assertIn("85°C/96", row[0])
+        self.assertIn("|y", row[1])          # 85 °C core is hot: yellow

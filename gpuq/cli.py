@@ -633,7 +633,7 @@ def screen_summary(views, hosts, now, width, focus, flagged=()):
                  else "idle" if not q else "free, %d waiting" % waiting),
             frees=frees_at(snap, now), next="+%d" % waiting if r and waiting else "-",
             used=m.get("used_mib"), gib=c.get("mib"), shared=bool(c.get("integrated")),
-            util=m.get("util"), model=",".join(r["models"]) if r else "", st=st))
+            util=m.get("util"), temp=m.get("temp_c"), vram_temp=m.get("vram_temp_c"), model=",".join(r["models"]) if r else "", st=st))
     # the same GPU model on two machines: name the machine too
     names = [f["name"] for f in rows]
     for f in rows:
@@ -650,9 +650,13 @@ def screen_summary(views, hosts, now, width, focus, flagged=()):
         pct = "%3d%%" % f["util"] if f["util"] is not None else "  ?"
         return "%s %s" % (_bar(f["util"] / 100 if f["util"] is not None else None, bars), pct) if bars else pct
 
+    temps = any(f.get("temp") is not None for f in rows)     # the TEMP column only where a card reports one
+
     def build(bars, show_model):
-        heads = ["GPU", "NOW", "FREES", "NEXT", "MEM", "UTIL"] + (["MODEL"] if show_model else [])
+        heads = ["GPU", "NOW", "FREES", "NEXT", "MEM", "UTIL"] + (["TEMP"] if temps else []) + (["MODEL"] if show_model else [])
         table = [[f["name"], f["now"], f["frees"], f["next"], mem(f, bars), util(f, bars)] +
+                 ([("%d°C" % f["temp"] if f.get("temp") is not None else "?") +
+                   ("/%d" % f["vram_temp"] if f.get("vram_temp") is not None else "")] if temps else []) +
                  ([f["model"]] if show_model else []) for f in rows]
         ni = heads.index("NOW")
         widths = [max([len(r[i]) for r in table] + [len(heads[i])]) for i in range(len(heads))]
@@ -690,6 +694,8 @@ def screen_summary(views, hosts, now, width, focus, flagged=()):
             spans.append("g%d:%d" % (fr, fr + 3))
         elif f["frees"] in ("over", "soon"):
             spans.append("y%d:%d" % (fr, fr + 4))
+        if temps and ((f.get("temp") or 0) >= HOT_C or (f.get("vram_temp") or 0) >= VRAM_HOT_C):
+            spans.append("y%d:%d" % (col["TEMP"], col["TEMP"] + widths[heads.index("TEMP")]))
         if f["used"] is not None and f["gib"] and f["used"] / f["gib"] >= 0.95:
             spans.append("y%d:%d" % (col["MEM"], col["MEM"] + widths[heads.index("MEM")]))
         out.append((line[:max(width - 1, 0)], f["st"] + "".join("|" + x for x in spans)))
@@ -1628,9 +1634,14 @@ def _place_residents(use, residents):
         u["jobs"] = keep
 
 
+VRAM_TEMP_DIR = Path(os.environ.get("GPUQ_VRAM_TEMP_DIR", "/run/gpuq"))
+VRAM_HOT_C = 100   # GDDR6X: 80-95 °C is normal under load, it throttles near 110
+HOT_C = 83      # a card at or above this shows its temperature in yellow (NVIDIA cards slow down near here)
+
+
 def card_meters(cards):
-    """{card: {"used_mib", "util"}}: memory in use and utilization percent per card, for the TUI's
-    summary bars. nvidia-smi for NVIDIA; sysfs for AMD (an iGPU's memory is its GTT use).
+    """{card: {"used_mib", "util", "temp_c"}}: memory in use, utilization percent and temperature per
+    card, for the TUI's summary. nvidia-smi for NVIDIA; sysfs for AMD (an iGPU's memory is its GTT use).
     Either value may be None. Empty under GPUQ_CARDS (the tests' fake cards)."""
     out = {}
     if os.environ.get("GPUQ_CARDS"):
@@ -1638,22 +1649,31 @@ def card_meters(cards):
     by_uuid = {c["uuid"]: n for n, c in cards.items() if c.get("vendor") != "amd" and c.get("uuid")}
     if by_uuid:
         try:
-            r = subprocess.run(["nvidia-smi", "--query-gpu=uuid,memory.used,utilization.gpu",
+            r = subprocess.run(["nvidia-smi", "--query-gpu=uuid,memory.used,utilization.gpu,temperature.gpu",
                                 "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10)
             for line in r.stdout.splitlines() if r.returncode == 0 else []:
-                uuid, used, util = [x.strip() for x in line.split(",")]
+                uuid, used, util, temp = [x.strip() for x in line.split(",")]
                 if uuid in by_uuid:
                     out[by_uuid[uuid]] = {"used_mib": int(used) if used.isdigit() else None,
-                                          "util": int(util) if util.isdigit() else None}
+                                          "util": int(util) if util.isdigit() else None,
+                                          "temp_c": int(temp) if temp.isdigit() else None}
         except (OSError, ValueError, subprocess.TimeoutExpired):
             pass
+    # GeForce cards don't report their memory (GDDR6X junction) temperature through nvidia-smi. A root
+    # helper may write it, in whole °C, to /run/gpuq/vram-temp-<card>; gpuq only reads that file.
+    for n in cards:
+        t = _read(VRAM_TEMP_DIR / ("vram-temp-%s" % n)).strip()
+        if t.isdigit():
+            out.setdefault(n, {})["vram_temp_c"] = int(t)
     for n, c in cards.items():
         if c.get("vendor") == "amd":
             d = SYSFS / "class" / "drm" / _card_dir(c) / "device"
             used = _read(d / ("mem_info_gtt_used" if c.get("integrated") else "mem_info_vram_used"))
             util = _read(d / "gpu_busy_percent")
-            out[n] = {"used_mib": int(used) >> 20 if used.isdigit() else None,
-                      "util": int(util) if util.isdigit() else None}
+            temp = next((t for t in (_read(h / "temp1_input") for h in sorted(d.glob("hwmon/hwmon*"))) if t.isdigit()), "")
+            out.setdefault(n, {}).update({"used_mib": int(used) >> 20 if used.isdigit() else None,
+                                          "util": int(util) if util.isdigit() else None,
+                                          "temp_c": int(temp) // 1000 if temp else None})
     return out
 
 
